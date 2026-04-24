@@ -1,0 +1,4 @@
+OH, ASHLAND
+STEISKAL, JODI
+Book & Page 989-3359
+node index.js --propertyId=888888 --ownerLastName="STEISKAL" --ownerFirstName="JODI" --county="ASHLAND" --state="OH" --book="989" --page="3359"

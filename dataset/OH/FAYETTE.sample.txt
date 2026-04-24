@@ -1,0 +1,4 @@
+OH, FAYETTE
+RONALD J WEADE PROPERTIES LLC
+Book & Page 215-3061
+node index.js --propertyId=808 --ownerLastName="RONALD J WEADE PROPERTIES LLC" --county="FAYETTE" --state="OH" --book="215" --page="3061"

@@ -1,0 +1,4 @@
+OH, OTTAWA
+RITCH, ROXANNE
+Book & Page 2047-483
+node index.js --propertyId=888888 --ownerLastName="RITCH" --ownerFirstName="ROXANNE" --county="OTTAWA" --state="OH" --book="2047" --page="483"

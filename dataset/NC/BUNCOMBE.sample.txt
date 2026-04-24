@@ -1,0 +1,4 @@
+NC, BUNCOMBE
+JA VENTURES LLC
+Book & Page 6230-103
+node index.js --propertyId=88991 --ownerLastName="JA VENTURES LLC" --county="BUNCOMBE" --state="NC" --book="6230" --page="103"

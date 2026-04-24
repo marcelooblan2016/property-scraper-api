@@ -1,0 +1,4 @@
+NY, QUEENS
+MANTRI, SAJANI
+Block & Lot: 3159-119
+node index.js --propertyId=88 --ownerLastName="MANTRI" --ownerFirstName="SAJANI" --county="QUEENS" --state="NY" --block="3159" --lot="119"

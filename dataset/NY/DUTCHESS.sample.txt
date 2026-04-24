@@ -1,0 +1,4 @@
+NY, DUTCHESS
+COLEMAN, LIONEL
+Book & Page 1844-817
+node index.js --propertyId=888 --ownerLastName="COLEMAN" --ownerFirstName="LIONEL" --county="DUTCHESS" --state="NY" --book="1844" --page="817"

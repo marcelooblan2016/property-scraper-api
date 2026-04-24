@@ -1,0 +1,4 @@
+NJ, UNION
+VELARDE, BENJAMIN M
+Book & Page 4869-212
+node index.js --propertyId=888888 --ownerLastName="VELARDE" --ownerFirstName="BENJAMIN" --county="UNION" --state="NJ" --book="4869" --page="212"

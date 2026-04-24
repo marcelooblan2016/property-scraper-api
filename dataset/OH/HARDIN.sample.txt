@@ -1,0 +1,4 @@
+OH, HARDIN
+WYNDHAM ENTERPRISES LTD
+Book & Page 513-577
+node index.js --propertyId=888888 --ownerLastName="WYNDHAM ENTERPRISES LTD" --county="HARDIN" --state="OH" --book="513" --page="577"

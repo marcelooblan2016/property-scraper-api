@@ -1,0 +1,4 @@
+IA, POLK
+DEVIN DAVID P
+Book & Page 11115-319
+node index.js --propertyId=93000111 --ownerLastName="DEVIN" --ownerFirstName="DAVID" --county="POLK" --state="IA" --book="11115" --page="319"

@@ -1,0 +1,28 @@
+{
+  "name": "property-scraper-api",
+  "version": "1.0.0",
+  "description": "Property deed scraper API — type1 (local/bot) and type2 (Browserbase/human-in-the-loop). Integrates with Laravel via Express REST API.",
+  "main": "app/server.js",
+  "scripts": {
+    "start": "node app/server.js",
+    "dev": "nodemon app/server.js",
+    "cli:bot": "node index.js --scraper=bot",
+    "cli:human": "node index.js --scraper=human"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "^3.0.0",
+    "@browserbasehq/sdk": "^2.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "lodash": "^4.17.21",
+    "minimist": "^1.2.8",
+    "playwright-core": "^1.44.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

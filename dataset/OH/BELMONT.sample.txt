@@ -1,0 +1,4 @@
+OH, BELMONT
+FUCHS, MICHAEL
+Book & Page 169-376
+node index.js --propertyId=8888888 --ownerLastName="FUCHS" --ownerFirstName="MICHAEL" --county="BELMONT" --state="OH" --book="169" --page="376"

@@ -1,0 +1,6 @@
+NY, BRONX
+CASTILLO, LILLIAN
+Block & Lot: 2290-137
+Book & Page: 1043-1667
+node index.js --propertyId=99 --ownerLastName="CASTILLO" --ownerFirstName="LILLIAN" --county="BRONX" --state="NY" --block="2290" --lot="137" --book="1043" --page="1667"
+

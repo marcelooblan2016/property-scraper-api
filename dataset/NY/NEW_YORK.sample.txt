@@ -1,0 +1,5 @@
+NY, NEW YORK (MANHATTAN)
+CONZEN, SALOME
+Block & Lot: 575-126
+node index.js --propertyId=100000 --ownerLastName="CONZEN" --ownerFirstName="SALOME" --county="NEW YORK" --state="NY" --block="575" --lot="126"
+

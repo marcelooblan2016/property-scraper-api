@@ -1,0 +1,5 @@
+NY, KINGS
+SPARKMAN, CAROL
+Block & Lot: 1817-41
+node index.js --propertyId=898989 --ownerLastName="SPARKMAN" --ownerFirstName="CAROL" --county="KINGS" --state="NY" --block="1817" --lot="41"
+

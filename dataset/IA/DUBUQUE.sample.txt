@@ -1,0 +1,80 @@
+IA, DUBUQUE
+JESSICA M ARENSDORF / BRANDON L ARENSDORF
+Book & Page 8855
+Block & Lot 2-12
+Street Address 9909 ELLE CT
+Subdivision SILVER OAKS ESTATES
+Last Recorded 07/18/2017
+node index.js --propertyId=461256 --ownerLastName="ARENSDORF" --ownerFirstName="JESSICA" --county="DUBUQUE" --state="IA" --book --block="2" --lot="12" --subdivision="SILVER OAKS ESTATES" --streetAddress="9909 ELLE CT" --lastRecorded="07/18/2017"
+
+Full RQ:
+-Property-
+Street Address: 9909 ELLE CT
+City: DUBUQUE
+State: IA
+Postal Code: 52003
+Plus Four Postal Code: 8202
+Tract Number Identifier: 10105
+Census Block Identifier: 2
+Lot Identifier: 12
+Subdivision Identifier: SILVER OAKS ESTATES
+Municipality: DUBUQUE
+APN: 15-25-103-006
+
+-Legal Description-
+Text Description: LOT 12 SILVER OAKS ESTATES;
+
+-Unplatted Land-
+Township Number: 88N
+Township Range Section Identifier: 88N02E23
+
+-Property Owner-
+Owner Name: JESSICA M ARENSDORF / BRANDON L ARENSDORF
+Mailing Address: 9909 ELLE CT, DUBUQUE, IA 52003-8202
+
+-Dimmensions-
+Lot Area Square Feet Number: 78408
+Lot Area Acres Number: 1.8
+
+-Characteristics-
+Land Use Description: SFR
+
+-General Description-
+Year Built Date Identifier: 2017
+Total Stories Number: 1
+
+-Room Count-
+Total Living Area Square Feet Number: 2071
+
+-Property Tax-
+Land Value Amount: $110,100.00
+Improvement Value Amount: $574,400.00
+Total Assessed Value Amount: $684,500.00
+Realestate Total Tax Amount: $7,390.00
+Tax Year: 2024
+Market Value: $684,500.00
+
+-Sales History-
+Last Recording Date: 07/18/2017
+Last Sales Date: 07/17/2017
+Last Sales Price Amount: $58,000.00
+Document Number Identifier: 0000008855
+Price Per Square Foot Amount: $28.01
+Deed Type: WD
+Transfer Document Identifier: 0000008855
+
+-Mortgage History-
+First Mortgage Type Description: WD
+
+-Owner Transfer Information-
+Transfer Recording Date: 07/18/2017
+Transfer Sale Date: 07/17/2017
+Transfer Sale Price: $58,000.00
+Transfer Document Number: 0000008855
+Deed Type: WD
+
+-Neighborhood Area Information-
+
+-LAT LONG-
+Latitude: 42.409537
+Longitude: -90.683075

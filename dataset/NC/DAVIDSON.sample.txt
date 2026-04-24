@@ -1,0 +1,4 @@
+NC, DAVIDSON
+LANNING JORDAN
+Book & Page 2712-2405
+node index.js --propertyId=19009 --ownerLastName="LANNING" --ownerFirstName="JORDAN" --county="DAVIDSON" --state="NC" --book="2712" --page="2405"

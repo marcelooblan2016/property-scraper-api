@@ -1,0 +1,4 @@
+IA, HAMILTON
+JENNA ERB
+BOOK & PAGE 2019 834
+node index.js --propertyId=19993131 --ownerLastName="ERB" --ownerFirstName="JENNA" --county="HAMILTON" --state="IA" --book="2019" --page="834"

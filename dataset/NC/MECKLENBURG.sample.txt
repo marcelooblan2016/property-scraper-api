@@ -1,0 +1,4 @@
+NC, MECKLENBURG
+REYNOLDS TERENCE
+Book & Page 39820-808
+node index.js --propertyId=1123399 --ownerLastName="REYNOLDS" --ownerFirstName="TERENCE" --county="MECKLENBURG" --state="NC" --book="39820" --page="808"
