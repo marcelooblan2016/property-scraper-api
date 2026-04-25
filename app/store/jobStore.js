@@ -1,70 +1,174 @@
 'use strict';
 
 /**
- * store/jobStore.js
+ * app/store/jobStore.js
  *
- * In-memory job store.
+ * Redis-backed job store using ioredis.
+ * Survives server restarts and supports multiple Node processes.
  *
- * JobRecord shape:
+ * JobRecord persisted in Redis (JSON):
  * {
- *   id:            string        — uuid
- *   scraper:       'bot'|'human' — type1 or type2
- *   status:        'queued' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled'
- *   liveViewUrl:   string|null   — Browserbase live view URL (type2 only, while waiting)
- *   resumeEmitter: EventEmitter  — internal signal bus for handoff/cancel
- *   webhookUrl:    string|null   — Laravel callback URL
- *   result:        object|null   — e.g. { filePath }
- *   error:         string|null
- *   createdAt:     Date
- *   updatedAt:     Date
+ *   id:          string
+ *   scraper:     'bot' | 'human'
+ *   status:      'queued' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled'
+ *   liveViewUrl: string | null
+ *   webhookUrl:  string | null
+ *   result:      object | null
+ *   error:       string | null
+ *   createdAt:   string (ISO)
+ *   updatedAt:   string (ISO)
  * }
  *
- * NOTE: For multi-process / horizontally scaled deployments, replace this
- * Map with a Redis-backed store and use pub/sub for the resume signal.
+ * resumeEmitter (EventEmitter) is NOT stored in Redis — it only needs to
+ * exist for the lifetime of the current process. It lives in a local Map
+ * keyed by jobId. If the process restarts mid-job, the job stays in Redis
+ * as "running" but the emitter is gone. The resume route handles this
+ * gracefully by falling back to a Redis pub/sub signal.
+ *
+ * Required .env vars:
+ *   REDIS_URL  — e.g. redis://localhost:6379 or rediss://user:pass@host:6380
+ *
+ * Redis key pattern:
+ *   job:<id>   — Hash storing all job fields (TTL: 7 days)
+ *   jobs:index — Set of all job IDs (for listJobs)
  */
 
-const jobs = new Map();
+const Redis       = require('ioredis');
+const EventEmitter = require('events');
+
+// ── Redis client ──────────────────────────────────────────────────────────────
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    maxRetriesPerRequest: 3,
+    lazyConnect:          true,
+});
+
+redis.on('connect',   () => console.log('[redis] connected'));
+redis.on('error',     (err) => console.error('[redis] error:', err.message));
+redis.on('reconnecting', () => console.log('[redis] reconnecting...'));
+
+// ── local emitter store (in-process only) ─────────────────────────────────────
+// Keyed by jobId. Cleared when process restarts.
+const emitters = new Map();
+
+const JOB_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+const KEY  = (id) => `job:${id}`;
+const INDEX = 'jobs:index';
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+function makeEmitter(jobId) {
+    const emitter = new EventEmitter();
+    emitters.set(jobId, emitter);
+    return emitter;
+}
+
+function getEmitter(jobId) {
+    return emitters.get(jobId) || null;
+}
+
+function serialize(job) {
+    return {
+        id:          job.id,
+        scraper:     job.scraper,
+        status:      job.status,
+        liveViewUrl: job.liveViewUrl  ?? null,
+        webhookUrl:  job.webhookUrl   ?? null,
+        result:      job.result ? JSON.stringify(job.result) : null,
+        error:       job.error        ?? null,
+        createdAt:   job.createdAt instanceof Date
+            ? job.createdAt.toISOString()
+            : job.createdAt,
+        updatedAt:   job.updatedAt instanceof Date
+            ? job.updatedAt.toISOString()
+            : job.updatedAt,
+    };
+}
+
+function deserialize(raw) {
+    if (!raw) return null;
+    return {
+        ...raw,
+        result:      raw.result ? JSON.parse(raw.result) : null,
+        liveViewUrl: raw.liveViewUrl === 'null' ? null : raw.liveViewUrl,
+        error:       raw.error       === 'null' ? null : raw.error,
+        resumeEmitter: getEmitter(raw.id),
+    };
+}
+
+// ── public API ────────────────────────────────────────────────────────────────
 
 /**
- * Add a new job to the store.
- * @param {object} job
- * @returns {object} the same job
+ * Create a new job in Redis.
+ * @param {object} job — must include id, scraper, status, webhookUrl
+ * @returns {Promise<object>} the full job record (with resumeEmitter attached)
  */
-function createJob(job) {
-    jobs.set(job.id, job);
-    return job;
+async function createJob(job) {
+    const emitter   = makeEmitter(job.id);
+    const now       = new Date().toISOString();
+    const toStore   = serialize({
+        ...job,
+        createdAt: now,
+        updatedAt: now,
+    });
+
+    const pipeline = redis.pipeline();
+    pipeline.hset(KEY(job.id), toStore);
+    pipeline.expire(KEY(job.id), JOB_TTL_SECONDS);
+    pipeline.sadd(INDEX, job.id);
+    await pipeline.exec();
+
+    return { ...job, resumeEmitter: emitter, createdAt: now, updatedAt: now };
 }
 
 /**
  * Retrieve a job by id.
  * @param {string} id
- * @returns {object|undefined}
+ * @returns {Promise<object|null>}
  */
-function getJob(id) {
-    return jobs.get(id);
+async function getJob(id) {
+    const raw = await redis.hgetall(KEY(id));
+    if (!raw || Object.keys(raw).length === 0) return null;
+    return deserialize(raw);
 }
 
 /**
- * Patch a job's fields and update `updatedAt`.
+ * Patch a job's fields and update updatedAt.
  * @param {string} id
  * @param {object} patch
+ * @returns {Promise<void>}
  */
-function updateJob(id, patch) {
-    const job = jobs.get(id);
-    if (!job) return;
-    Object.assign(job, patch, { updatedAt: new Date() });
+async function updateJob(id, patch) {
+    const now     = new Date().toISOString();
+    const current = await getJob(id);
+    if (!current) return;
+
+    const updated = serialize({ ...current, ...patch, updatedAt: now });
+    const pipeline = redis.pipeline();
+    pipeline.hset(KEY(id), updated);
+    pipeline.expire(KEY(id), JOB_TTL_SECONDS);
+    await pipeline.exec();
 }
 
 /**
- * Return all jobs as an array.
- * @returns {object[]}
+ * Return all jobs as an array (most recent first).
+ * @returns {Promise<object[]>}
  */
-function listJobs() {
-    return [...jobs.values()];
+async function listJobs() {
+    const ids = await redis.smembers(INDEX);
+    if (!ids.length) return [];
+
+    const pipeline = redis.pipeline();
+    ids.forEach(id => pipeline.hgetall(KEY(id)));
+    const results = await pipeline.exec();
+
+    return results
+        .map(([err, raw]) => err ? null : deserialize(raw))
+        .filter(Boolean)
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
 /**
- * Strip internal fields (resumeEmitter) before sending to clients.
+ * Strip internal fields before sending to clients.
  * @param {object} job
  * @returns {object}
  */
@@ -81,10 +185,34 @@ function serializeJob(job) {
     };
 }
 
+/**
+ * Emit a signal on the job's local resumeEmitter.
+ * Falls back to Redis pub/sub if the emitter doesn't exist in this process
+ * (e.g. after a restart while a job was mid-flight).
+ * @param {string} id
+ * @param {'resume'|'cancel'} signal
+ * @returns {Promise<void>}
+ */
+async function signalJob(id, signal) {
+    const emitter = getEmitter(id);
+    if (emitter) {
+        emitter.emit(signal);
+    } else {
+        // Process restarted — emitter is gone but job still exists in Redis.
+        // Publish to Redis pub/sub so any subscriber (same or other process) picks it up.
+        await redis.publish(`job:signal:${id}`, signal);
+        console.warn(`[jobStore] emitter not found for job ${id} — published via Redis pub/sub`);
+    }
+}
+
 module.exports = {
+    redis,
     createJob,
     getJob,
     updateJob,
     listJobs,
     serializeJob,
+    signalJob,
+    makeEmitter,
+    getEmitter,
 };

@@ -2,3 +2,21 @@ OH, HARDIN
 WYNDHAM ENTERPRISES LTD
 Book & Page 513-577
 node index.js --propertyId=888888 --ownerLastName="WYNDHAM ENTERPRISES LTD" --county="HARDIN" --state="OH" --book="513" --page="577"
+
+
+curl -X POST http://localhost:4000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer supersecret" \
+  -d '{
+    "scraper": "bot",
+    "query": {
+      "propertyId": "88888888888",
+      "ownerLastName": "WYNDHAM ENTERPRISES LTD",
+      "ownerFirstName": "",
+      "county": "HARDIN",
+      "state": "OH",
+      "book": "513",
+      "page": "577"
+    },
+    "webhookUrl": null
+  }'

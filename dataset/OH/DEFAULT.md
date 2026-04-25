@@ -9,7 +9,7 @@
 [page][clickselector] #dialog img[src*="close.gif"]
 [stagehand][act] click `Search Public Records` option under `What would you like to do today?`
 [page][waitfor] 3000
-[stagehand][observe] find `Specific Criteria` section
+[stagehand][act] if there is a modal or dialog visible, click the X button to close it, otherwise do nothing
 [stagehand][act] under `Specific Criteria` type `${query.lastFirstName}` into the `Name` field
 [stagehand][act] click `Search` button
 [stagehand][observe] find search results table
