@@ -5,14 +5,18 @@ const _             = require('lodash');
 const fs            = require('fs');
 const path          = require('path');
 const os            = require('os');
-const helper        = require("../../helper.js");
+const helper        = require("../../helpers/generalHelper.js");
+const { uploadToS3 } = require('../../helpers/s3Uploader.js');
 
 dotenv.config();
 
 class PropertyScraper {
 
-    constructor({ query }) {
-        this.query = query;
+    constructor({ query, standalone = false, onComplete, onError }) {
+        this.query      = query;
+        this.standalone = standalone; // true = CLI (can process.exit), false = Express (must not)
+        this.onComplete = onComplete || (async () => {});
+        this.onError    = onError    || (async () => {});
 
         const OPENAI_API_KEY    = process.env.SAM_SCRAPER_OPENAI_API_KEY;
         const OPENAI_MODEL      = process.env.SAM_SCRAPER_OPENAI_MODEL;
@@ -140,9 +144,13 @@ class PropertyScraper {
 
             try {
                 await this.page.waitForTimeout(2000);
-                let isFileDownloaded = await this.isFileDownloaded();
+                const isFileDownloaded = await this.isFileDownloaded();
                 if (isFileDownloaded === true) {
+                    const filePath = `./downloads/${_.get(this.query, 'propertyId')}/deed.pdf`;
+                    const s3Result = await this.uploadAndCleanup();
+                    await this.onComplete({ filePath, ...s3Result });
                     await this.closeProcess();
+                    return;
                 }
             } catch {
                 // Page may have closed after download
@@ -151,12 +159,14 @@ class PropertyScraper {
             await this.page.waitForTimeout(2000);
         }
 
+        // All retries exhausted without a successful download
+        await this.onError({ error: 'All retries exhausted — file not downloaded' });
         await this.closeProcess();
     }
 
     async closeProcess() {
         await this.stagehand?.close().catch(() => {});
-        process.exit(0);
+        if (this.standalone) process.exit(0);
     }
 
     async isFileDownloaded() {
@@ -167,6 +177,20 @@ class PropertyScraper {
             return true;
         }
         return false;
+    }
+
+    async uploadAndCleanup() {
+        const propertyId = _.get(this.query, 'propertyId', null);
+        const localPath  = `./downloads/${propertyId}/deed.pdf`;
+        try {
+            const { s3Key, s3Url } = await uploadToS3({ localPath, propertyId });
+            console.info(`[s3] deed uploaded | key: ${s3Key}`);
+            console.info(`[s3] url: ${s3Url}`);
+            return { s3Key, s3Url };
+        } catch (err) {
+            console.error('[s3] upload failed:', err.message);
+            return { s3Key: null, s3Url: null };
+        }
     }
 
     async executeActions(actions = []) {

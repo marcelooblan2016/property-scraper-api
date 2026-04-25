@@ -11,7 +11,7 @@
 
 'use strict';
 
-const helper = require('./helper.js');
+const helper = require('./helpers/generalHelper.js');
 const dotenv = require('dotenv');
 const path   = require('path');
 

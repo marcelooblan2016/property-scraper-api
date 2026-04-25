@@ -79,12 +79,12 @@ async function runScraper(job, query) {
         },
 
         /**
-         * onComplete — scraper downloaded the PDF successfully
+         * onComplete — scraper downloaded and uploaded the PDF to S3 successfully
          */
-        onComplete: async ({ filePath }) => {
-            updateJob(job.id, { status: 'completed', result: { filePath } });
-            console.log(`[job:${job.id}] completed | file: ${filePath}`);
-            await fireWebhook(job, { status: 'completed', filePath });
+        onComplete: async ({ filePath, s3Key, s3Url }) => {
+            updateJob(job.id, { status: 'completed', result: { filePath, s3Key, s3Url } });
+            console.log(`[job:${job.id}] completed | s3: ${s3Url || filePath}`);
+            await fireWebhook(job, { status: 'completed', filePath, s3Key, s3Url });
         },
 
         /**
@@ -98,7 +98,7 @@ async function runScraper(job, query) {
     };
 
     // ── run ───────────────────────────────────────────────────────────────────
-    const instance = new ScraperClass({ query, ...callbacks });
+    const instance = new ScraperClass({ query, standalone: false, ...callbacks });
     await instance.startNow();
 }
 

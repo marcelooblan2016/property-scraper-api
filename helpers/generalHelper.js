@@ -1,7 +1,7 @@
 const minimist = require('minimist');
 const _ = require('lodash');
 
-class helper {
+class generalHelper {
 
     collectArguments() {
         return minimist(process.argv.slice(2));
@@ -171,4 +171,4 @@ class helper {
     }
 }
 
-module.exports = helper;
+module.exports = generalHelper;

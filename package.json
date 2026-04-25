@@ -10,8 +10,9 @@
     "cli:human": "node index.js --scraper=human"
   },
   "dependencies": {
-    "@browserbasehq/stagehand": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.1037.0",
     "@browserbasehq/sdk": "^2.0.0",
+    "@browserbasehq/stagehand": "^3.0.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "lodash": "^4.17.21",

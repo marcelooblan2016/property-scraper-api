@@ -36,7 +36,8 @@ const dotenv        = require('dotenv');
 const _             = require('lodash');
 const fs            = require('fs');
 const path          = require('path');
-const helper        = require('../../helper.js');
+const helper        = require('../../helpers/generalHelper.js');
+const { uploadToS3 } = require('../../helpers/s3Uploader.js');
 
 dotenv.config();
 
@@ -177,7 +178,8 @@ class PropertyScraperHuman {
                 const downloaded = await this.isFileDownloaded();
                 if (downloaded) {
                     const filePath = `./downloads/${_.get(this.query, 'propertyId')}/deed.pdf`;
-                    await this.onComplete({ filePath });
+                    const s3Result = await this.uploadAndCleanup();
+                    await this.onComplete({ filePath, ...s3Result });
                     await this.closeProcess();
                     return;
                 }
@@ -202,6 +204,21 @@ class PropertyScraperHuman {
             return true;
         }
         return false;
+    }
+
+    async uploadAndCleanup() {
+        const propertyId = _.get(this.query, 'propertyId', null);
+        const localPath  = `./downloads/${propertyId}/deed.pdf`;
+        try {
+            const { s3Key, s3Url } = await uploadToS3({ localPath, propertyId });
+            console.info(`[s3] deed uploaded | key: ${s3Key}`);
+            console.info(`[s3] url: ${s3Url}`);
+            return { s3Key, s3Url };
+        } catch (err) {
+            // S3 upload failure should not block completion — log and continue
+            console.error('[s3] upload failed:', err.message);
+            return { s3Key: null, s3Url: null };
+        }
     }
 
     // ── action runner ─────────────────────────────────────────────────────────
