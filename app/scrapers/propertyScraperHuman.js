@@ -83,7 +83,6 @@ class PropertyScraperHuman {
         this.page             = null;
         this.helper           = new helper();
         this.abortActions     = false;
-        this.retriesParameter = [];
     }
 
     // ── Browserbase live view URL ─────────────────────────────────────────────
@@ -99,34 +98,19 @@ class PropertyScraperHuman {
         console.log('[human] page ready:', this.page.url());
     }
 
-    // ── .md file resolution (identical to type1) ──────────────────────────────
-    async prepareMdFiles(index) {
-        this.currentRetry = this.retriesParameter[index];
-        this.mdFileSuffix = '';
+    // ── .md file resolution ───────────────────────────────────────────────────
+    // Type2 has no retry loop — the human is watching, so we just resolve
+    // the correct .md file once and run it top to bottom.
+    resolveMdFile(county, state) {
+        // County-specific file takes priority: dataset/OH/BUTLER.md
+        let fileMarkdown = `./dataset/${state}/${county}.md`;
 
-        const rules = {
-            'book-page':       { fields: ['book', 'page'],       suffix: '' },
-            'lot-subdivision': { fields: ['lot', 'subdivision'], suffix: '-lot-subdivision' },
-            'block-lot':       { fields: ['block', 'lot'],       suffix: '-block-lot' },
-            'lot':             { fields: ['lot'],                suffix: '-lot' },
-            'township':        { fields: ['township'],           suffix: '-township' },
-            'apn':             { fields: ['apn'],                suffix: '-apn' },
-            'last-recorded':   { fields: ['lastRecorded'],       suffix: '-last-recorded' },
-        };
+        // Fall back to DEFAULT.md if county-specific file doesn't exist
+        if (!fs.existsSync(fileMarkdown)) {
+            fileMarkdown = `./dataset/${state}/DEFAULT.md`;
+        }
 
-        const rule = rules[this.currentRetry];
-        if (!rule) return false;
-
-        const hasValue = (key) => {
-            const value = _.get(this.query, key);
-            if (value == null) return false;
-            if (typeof value === 'string') return value.trim() !== '';
-            return true;
-        };
-
-        if (!rule.fields.every(hasValue)) return false;
-        this.mdFileSuffix = rule.suffix;
-        return true;
+        return fileMarkdown;
     }
 
     async startNow() {
@@ -134,60 +118,39 @@ class PropertyScraperHuman {
             .trim().replace(/\s+/g, '_').toUpperCase();
         let state  = _.get(this.query, 'state', 'unknown');
 
-        const fileRetries = `./dataset/${state}/RETRIES.json`;
-        this.retriesParameter = fs.existsSync(fileRetries)
-            ? JSON.parse(fs.readFileSync(fileRetries, 'utf8'))
-            : ['book-page'];
-
         await this.stagehand.init();
 
-        for (let i in this.retriesParameter) {
+        const fileMarkdown = this.resolveMdFile(county, state);
+        console.info(`[human] markdown: ${fileMarkdown}`);
 
-            if (!(await this.prepareMdFiles(i))) {
-                console.info(`[human] skipping ${this.currentRetry}`);
-                continue;
-            }
-
-            let fileMarkdown = `./dataset/${state}/${county}${this.mdFileSuffix}.md`;
-            const validListPath = `./dataset/${state}/counties.txt`;
-
-            if (fs.existsSync(validListPath)) {
-                const validList = (await fs.promises.readFile(validListPath, 'utf8'))
-                    .split('\n').filter(l => l.trim());
-                if (validList.includes(county)) {
-                    fileMarkdown = `./dataset/${state}/DEFAULT${this.mdFileSuffix}.md`;
-                }
-            }
-
-            console.info(`[human] markdown: ${fileMarkdown}`);
-            if (!fs.existsSync(fileMarkdown)) {
-                console.info(`[human] markdown not found, skipping`);
-                continue;
-            }
-
-            const contents = await fs.promises.readFile(fileMarkdown, 'utf8');
-            const actions  = contents.split('\n').filter(l => l.trim());
-
-            await this._ensurePageReady();
-            await this.executeActions(actions);
-
-            this.abortActions = false;
-
-            try {
-                await this.page.waitForTimeout(2000);
-                const downloaded = await this.isFileDownloaded();
-                if (downloaded) {
-                    const filePath = `./downloads/${_.get(this.query, 'propertyId')}/deed.pdf`;
-                    const s3Result = await this.uploadAndCleanup();
-                    await this.onComplete({ filePath, ...s3Result });
-                    await this.closeProcess();
-                    return;
-                }
-            } catch { /* page may have closed */ }
-
-            await this.page.waitForTimeout(2000);
+        if (!fs.existsSync(fileMarkdown)) {
+            const error = `Markdown not found: ${fileMarkdown}`;
+            console.error(`[human] ${error}`);
+            await this.onError({ error });
+            await this.closeProcess();
+            return;
         }
 
+        const contents = await fs.promises.readFile(fileMarkdown, 'utf8');
+        const actions  = contents.split('\n').filter(l => l.trim());
+
+        await this._ensurePageReady();
+        await this.executeActions(actions);
+
+        try {
+            await this.page.waitForTimeout(2000);
+            const downloaded = await this.isFileDownloaded();
+            if (downloaded) {
+                const filePath = `./downloads/${_.get(this.query, 'propertyId')}/deed.pdf`;
+                const s3Result = await this.uploadAndCleanup();
+                await this.onComplete({ filePath, ...s3Result });
+                await this.closeProcess();
+                return;
+            }
+        } catch { /* page may have closed */ }
+
+        // Actions completed — no file downloaded (may be intentional for human-only flows)
+        await this.onComplete({ filePath: null, s3Key: null, s3Url: null });
         await this.closeProcess();
     }
 
