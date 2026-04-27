@@ -31,12 +31,13 @@
 
 'use strict';
 
-const { Stagehand } = require('@browserbasehq/stagehand');
-const dotenv        = require('dotenv');
-const _             = require('lodash');
-const fs            = require('fs');
-const path          = require('path');
-const helper        = require('../../helpers/generalHelper.js');
+const { Stagehand }  = require('@browserbasehq/stagehand');
+const Browserbase    = require('@browserbasehq/sdk').default;
+const dotenv         = require('dotenv');
+const _              = require('lodash');
+const fs             = require('fs');
+const path           = require('path');
+const helper         = require('../../helpers/generalHelper.js');
 const { uploadToS3 } = require('../../helpers/s3Uploader.js');
 
 dotenv.config();
@@ -50,11 +51,13 @@ class PropertyScraperHuman {
      * @param {function} options.onComplete   — async ({ filePath }) => void
      * @param {function} options.onError      — async ({ error: string }) => void
      */
-    constructor({ query, onHandoff, onComplete, onError }) {
-        this.query      = query;
-        this.onHandoff  = onHandoff  || (async () => {});
-        this.onComplete = onComplete || (async () => {});
-        this.onError    = onError    || (async () => {});
+    constructor({ query, onHandoff, onComplete, onError, onTakeoverSignal, onSessionReady }) {
+        this.query             = query;
+        this.onHandoff         = onHandoff        || (async () => {});
+        this.onComplete        = onComplete       || (async () => {});
+        this.onError           = onError          || (async () => {});
+        this.onSessionReady    = onSessionReady   || (async () => {}); // fired as soon as session URL is available
+        this.onTakeoverSignal  = onTakeoverSignal || null;
 
         const ANTHROPIC_API_KEY = process.env.SAM_SCRAPER_ANTHROPIC_API_KEY;
         const ANTHROPIC_MODEL   = process.env.SAM_SCRAPER_ANTHROPIC_MODEL;
@@ -83,13 +86,24 @@ class PropertyScraperHuman {
         this.page             = null;
         this.helper           = new helper();
         this.abortActions     = false;
+        this.takeoverRequested = false; // set true when POST /jobs/:id/takeover is called
     }
 
     // ── Browserbase live view URL ─────────────────────────────────────────────
-    getLiveViewUrl() {
+    // Uses bb.sessions.debug() to get the debuggerFullscreenUrl which is
+    // publicly embeddable in an iframe — no Browserbase login required.
+    async getLiveViewUrl() {
         const sessionId = this.stagehand.browserbaseSessionID;
         if (!sessionId) return null;
-        return `https://www.browserbase.com/sessions/${sessionId}`;
+        try {
+            const bb    = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
+            const debug = await bb.sessions.debug(sessionId);
+            // debuggerFullscreenUrl works in an iframe without auth
+            return debug.debuggerFullscreenUrl || null;
+        } catch (err) {
+            console.error('[human] failed to get live view url:', err.message);
+            return null;
+        }
     }
 
     async _ensurePageReady() {
@@ -119,6 +133,24 @@ class PropertyScraperHuman {
         let state  = _.get(this.query, 'state', 'unknown');
 
         await this.stagehand.init();
+
+        // Fetch the live view URL as soon as the session is ready and
+        // broadcast it so Laravel can show the iframe immediately —
+        // before the first [stagehand][handoff] is even reached.
+        const initialLiveViewUrl = await this.getLiveViewUrl();
+        if (initialLiveViewUrl) {
+            console.log(`[human] session live view: ${initialLiveViewUrl}`);
+            await this.onSessionReady({ liveViewUrl: initialLiveViewUrl });
+        }
+
+        // Listen for takeover signal from POST /jobs/:id/takeover
+        // The emitter is attached to the job record in jobStore
+        if (this.onTakeoverSignal) {
+            this.onTakeoverSignal(() => {
+                console.log('[human] takeover requested — will pause after current action');
+                this.takeoverRequested = true;
+            });
+        }
 
         const fileMarkdown = this.resolveMdFile(county, state);
         console.info(`[human] markdown: ${fileMarkdown}`);
@@ -155,8 +187,21 @@ class PropertyScraperHuman {
     }
 
     async closeProcess() {
+        // Close Stagehand (disconnects Playwright)
         await this.stagehand?.close().catch(() => {});
-        // Note: do NOT call process.exit() — server.js manages the process lifecycle
+
+        // Explicitly stop the Browserbase session so it doesn't keep running
+        // and burning session minutes after the scraper is done.
+        const sessionId = this.stagehand?.browserbaseSessionID;
+        if (sessionId) {
+            try {
+                const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
+                await bb.sessions.stop(sessionId);
+                console.log(`[human] Browserbase session stopped: ${sessionId}`);
+            } catch (err) {
+                console.error('[human] failed to stop Browserbase session:', err.message);
+            }
+        }
     }
 
     async isFileDownloaded() {
@@ -254,6 +299,19 @@ class PropertyScraperHuman {
                 break;
             }
 
+            // ── takeover check ────────────────────────────────────────────────
+            // Human requested control mid-run — pause here same as [stagehand][handoff]
+            if (this.takeoverRequested) {
+                this.takeoverRequested = false;
+                console.log('[human] takeover — pausing bot');
+                await this.onHandoff({
+                    message: 'You requested control. Click Resume when you are done.',
+                });
+                console.log('[human] takeover — resumed, continuing actions');
+                const pages = this.stagehand.context.pages();
+                this.page = pages[pages.length - 1];
+            }
+
             let line = this.helper.replaceVariables(String(raw).trim(), this.query);
             console.info('[human] action:', line);
 
@@ -308,11 +366,10 @@ class PropertyScraperHuman {
                     // Calls onHandoff → Express sets job to "waiting", returns
                     // liveViewUrl to Laravel. Suspends until resume signal arrives.
                     if (v === 'handoff') {
-                        const message     = payload || 'Complete the required steps, then click Resume in the app.';
-                        const liveViewUrl = this.getLiveViewUrl();
+                        const message = payload || 'Complete the required steps, then click Resume in the app.';
 
-                        console.log(`[human][handoff] suspending. liveViewUrl: ${liveViewUrl}`);
-                        await this.onHandoff({ liveViewUrl, message });
+                        console.log(`[human][handoff] suspending`);
+                        await this.onHandoff({ message });
                         console.log('[human][handoff] resumed');
 
                         // Re-acquire page after human interaction

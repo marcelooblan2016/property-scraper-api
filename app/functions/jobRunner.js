@@ -48,13 +48,25 @@ async function runScraper(job, query) {
     const callbacks = {
 
         /**
+         * onSessionReady — fires as soon as the Browserbase session is live.
+         * Updates the job with liveViewUrl so Laravel can show the iframe
+         * immediately, before the first [stagehand][handoff] is reached.
+         */
+        onSessionReady: async ({ liveViewUrl }) => {
+            await updateJob(job.id, { liveViewUrl });
+            console.log(`[job:${job.id}] session ready | liveViewUrl: ${liveViewUrl}`);
+        },
+
+        /**
          * onHandoff — type2 only
          * Suspends until signalJob('resume') or signalJob('cancel') is called.
          * Supports both local EventEmitter and Redis pub/sub (for post-restart resilience).
          */
-        onHandoff: async ({ liveViewUrl, message }) => {
-            await updateJob(job.id, { status: 'waiting', liveViewUrl });
-            console.log(`[job:${job.id}] waiting for human | liveViewUrl: ${liveViewUrl}`);
+        onHandoff: async ({ message }) => {
+            // Only update status — liveViewUrl is already set from onSessionReady
+            // and should remain visible to the user throughout the entire session.
+            await updateJob(job.id, { status: 'waiting' });
+            console.log(`[job:${job.id}] waiting for human`);
 
             await new Promise((resolve, reject) => {
                 const timeout = setTimeout(() => {
@@ -94,7 +106,7 @@ async function runScraper(job, query) {
                 }
             });
 
-            await updateJob(job.id, { status: 'running', liveViewUrl: null });
+            await updateJob(job.id, { status: 'running' });
             console.log(`[job:${job.id}] resumed by human`);
         },
 
@@ -108,8 +120,13 @@ async function runScraper(job, query) {
         },
 
         /**
-         * onError — unrecoverable scraper error
+         * onTakeoverSignal — registers a callback that fires when the takeover event
+         * is emitted (via POST /jobs/:id/takeover). Only relevant for type2.
          */
+        onTakeoverSignal: (callback) => {
+            const emitter = job.resumeEmitter;
+            if (emitter) emitter.on('takeover', callback);
+        },
         onError: async ({ error }) => {
             await updateJob(job.id, { status: 'failed', error });
             console.error(`[job:${job.id}] failed | ${error}`);
@@ -119,7 +136,25 @@ async function runScraper(job, query) {
 
     // ── run ───────────────────────────────────────────────────────────────────
     const instance = new ScraperClass({ query, standalone: false, ...callbacks });
-    await instance.startNow();
+    try {
+        await instance.startNow();
+    } finally {
+        // Session is ending — clear liveViewUrl since the browser is gone
+        await updateJob(job.id, { liveViewUrl: null });
+
+        // Safety net — ensure Browserbase session is stopped even if scraper throws
+        if (job.scraper === 'human') {
+            const sessionId = instance.stagehand?.browserbaseSessionID;
+            if (sessionId) {
+                try {
+                    const Browserbase = require('@browserbasehq/sdk').default;
+                    const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
+                    await bb.sessions.stop(sessionId);
+                    console.log(`[job:${job.id}] Browserbase session force-stopped: ${sessionId}`);
+                } catch { /* already stopped — ignore */ }
+            }
+        }
+    }
 }
 
 module.exports = { runScraper };

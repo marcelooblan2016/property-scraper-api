@@ -81,6 +81,23 @@ router.post('/:id/resume', async (req, res) => {
     return res.json({ ok: true });
 });
 
+// ── POST /jobs/:id/takeover ───────────────────────────────────────────────────
+// Human can request control at any point — even mid-action.
+// The scraper checks this flag between actions and pauses itself.
+router.post('/:id/takeover', async (req, res) => {
+    const job = await getJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    if (!['running', 'waiting'].includes(job.status)) {
+        return res.status(409).json({
+            error: `Job cannot be taken over (status: ${job.status})`,
+        });
+    }
+
+    await signalJob(job.id, 'takeover');
+    return res.json({ ok: true, message: 'Takeover requested — bot will pause after current action' });
+});
+
 // ── POST /jobs/:id/cancel ─────────────────────────────────────────────────────
 router.post('/:id/cancel', async (req, res) => {
     const job = await getJob(req.params.id);

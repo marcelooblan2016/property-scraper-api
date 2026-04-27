@@ -190,7 +190,7 @@ function serializeJob(job) {
  * Falls back to Redis pub/sub if the emitter doesn't exist in this process
  * (e.g. after a restart while a job was mid-flight).
  * @param {string} id
- * @param {'resume'|'cancel'} signal
+ * @param {'resume'|'cancel'|'takeover'} signal
  * @returns {Promise<void>}
  */
 async function signalJob(id, signal) {
@@ -198,8 +198,6 @@ async function signalJob(id, signal) {
     if (emitter) {
         emitter.emit(signal);
     } else {
-        // Process restarted — emitter is gone but job still exists in Redis.
-        // Publish to Redis pub/sub so any subscriber (same or other process) picks it up.
         await redis.publish(`job:signal:${id}`, signal);
         console.warn(`[jobStore] emitter not found for job ${id} — published via Redis pub/sub`);
     }
