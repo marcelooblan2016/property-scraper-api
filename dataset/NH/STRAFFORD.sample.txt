@@ -3,6 +3,8 @@ https://titlesearch.afxllc.com/projects/429466
 CROUSE RICHARD D / CROUSE KAYLIE R
 BOOK & PAGE: 4980-603
 
+node app/server.js
+
 node index.js --propertyId=429466 --ownerLastName="CROUSE" --ownerFirstName="RICHARD" --county="STRAFFORD" --state="NH" --book="4980" --page="603"
 
 
@@ -23,7 +25,10 @@ curl -X POST http://localhost:4000/jobs \
     "webhookUrl": null
   }'
 
-curl http://localhost:4000/jobs/1ab01d4a-6de6-4b6c-916e-0fae9d9017ee -H "Authorization: Bearer supersecret"
+curl http://localhost:4000/jobs/955a12e0-0441-4e7c-992d-2b0e7c056598 -H "Authorization: Bearer supersecret"
+
+
+curl http://localhost:4000/jobs/61584fda-9081-47e9-acc7-477e1b4b15ed/debug -H "Authorization: Bearer supersecret"
 
 
 curl -X POST http://localhost:4000/jobs/ba0c0478-6c81-4c32-b22e-b70f92b226eb/resume \

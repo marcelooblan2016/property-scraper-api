@@ -1,17 +1,19 @@
 /**
- * propertyScraperHuman.js — Type 2: Browserbase + Human-in-the-loop
+ * propertyScraperHuman.js — Type 2: Steel.dev + Human-in-the-loop
  *
  * Differences from type1 (propertyScraper.js):
- *  - Always uses Browserbase (env: BROWSERBASE)
- *  - keepAlive: true — session persists during human interaction
- *  - Accepts { onHandoff, onComplete, onError } callbacks from server.js
- *    so Express controls the resume signal, not a local HTTP server
+ *  - Uses Steel.dev cloud browser (steel-sdk) instead of local Chromium
+ *  - Stagehand connects to Steel session via CDP (env: LOCAL + cdpUrl)
+ *  - Session timeout: 2 hours (Steel default is 5 min — too short for human interaction)
+ *  - Session viewer (debugUrl) is publicly embeddable — no Steel login required
+ *  - Accepts { onHandoff, onComplete, onError, onSessionReady, onTakeoverSignal }
+ *    callbacks from jobRunner.js so Express controls the job lifecycle
  *
  * .md verbs (all type1 verbs + these new ones):
  *
  *  [stagehand][handoff] <message>
- *      Calls onHandoff({ liveViewUrl, message }) and suspends until
- *      Express receives POST /jobs/:id/resume from Laravel.
+ *      Bot pauses here. Calls onHandoff({ message }) — job status → "waiting".
+ *      Resumes when Laravel calls POST /jobs/:id/resume.
  *
  *  [stagehand][snapshot]
  *      Saves a screenshot to ./snapshots/<timestamp>.png
@@ -32,13 +34,13 @@
 'use strict';
 
 const { Stagehand }  = require('@browserbasehq/stagehand');
-const Browserbase    = require('@browserbasehq/sdk').default;
+const Steel          = require('steel-sdk').default;
 const dotenv         = require('dotenv');
 const _              = require('lodash');
 const fs             = require('fs');
 const path           = require('path');
 const helper         = require('../../helpers/generalHelper.js');
-const { uploadToS3 } = require('../../helpers/s3Uploader.js');
+const { uploadToS3 } = require('../../helpers/s3Uploader');
 
 dotenv.config();
 
@@ -46,17 +48,24 @@ class PropertyScraperHuman {
 
     /**
      * @param {object}   options
-     * @param {object}   options.query        — scraper query params (same as type1)
-     * @param {function} options.onHandoff    — async ({ liveViewUrl, message }) => void
-     * @param {function} options.onComplete   — async ({ filePath }) => void
-     * @param {function} options.onError      — async ({ error: string }) => void
+     * @param {object}   options.query             — scraper query params (same as type1)
+     * @param {function} options.onHandoff         — async ({ message }) => void
+     * @param {function} options.onComplete        — async ({ filePath, s3Key, s3Url }) => void
+     * @param {function} options.onError           — async ({ error: string }) => void
+     * @param {function} options.onSessionReady    — async ({ liveViewUrl, sessionId }) => void
+     * @param {function} options.onTakeoverSignal  — fn(callback) — registers takeover listener
+     *
+     * query fields specific to type2:
+     * @param {string|Array} options.query.cookies      — site cookies to inject (optional)
+     * @param {string}       options.query.cookieDomain — domain for cookie injection (optional)
+     * @param {object}       options.query.confirmOverrides — map of confirm questions → bool
      */
     constructor({ query, onHandoff, onComplete, onError, onTakeoverSignal, onSessionReady }) {
         this.query             = query;
         this.onHandoff         = onHandoff        || (async () => {});
         this.onComplete        = onComplete       || (async () => {});
         this.onError           = onError          || (async () => {});
-        this.onSessionReady    = onSessionReady   || (async () => {}); // fired as soon as session URL is available
+        this.onSessionReady    = onSessionReady   || (async () => {}); // fired once Steel session is live — sets liveViewUrl on the job
         this.onTakeoverSignal  = onTakeoverSignal || null;
 
         const ANTHROPIC_API_KEY = process.env.SAM_SCRAPER_ANTHROPIC_API_KEY;
@@ -68,42 +77,73 @@ class PropertyScraperHuman {
         process.env.ANTHROPIC_API_KEY = ANTHROPIC_API_KEY;
         process.env.OPENAI_API_KEY    = OPENAI_API_KEY;
 
-        this.stagehand = new Stagehand({
-            env:           'BROWSERBASE',
-            verbose:       1,
-            enableCaching: true,
-            model: useAnthropic
-                ? `anthropic/${ANTHROPIC_MODEL}`
-                : `openai/${OPENAI_MODEL}`,
-            apiKey:    process.env.BROWSERBASE_API_KEY,
-            projectId: process.env.BROWSERBASE_PROJECT_ID,
-            browserbaseSessionCreateParams: {
-                projectId: process.env.BROWSERBASE_PROJECT_ID,
-                keepAlive: true,   // session stays alive while human interacts
-            },
-        });
+        // Steel client — manages session lifecycle (create, release)
+        this.steel        = new Steel({ steelAPIKey: process.env.STEEL_API_KEY });
+        this.steelSession = null; // set in startNow() after Steel session is created
 
-        this.page             = null;
-        this.helper           = new helper();
-        this.abortActions     = false;
-        this.takeoverRequested = false; // set true when POST /jobs/:id/takeover is called
+        // Stagehand connects to the Steel session via CDP using env: LOCAL + cdpUrl.
+        // The cdpUrl is built in startNow() once the Steel session websocketUrl is known.
+        this._stagehandModel = useAnthropic
+            ? `anthropic/${ANTHROPIC_MODEL}`
+            : `openai/${OPENAI_MODEL}`;
+
+        this.stagehand = null; // initialised in startNow() after Steel session is ready
+
+        this.page              = null;
+        this.helper            = new helper();
+        this.abortActions      = false;
+        this.takeoverRequested = false;
     }
 
-    // ── Browserbase live view URL ─────────────────────────────────────────────
-    // Uses bb.sessions.debug() to get the debuggerFullscreenUrl which is
-    // publicly embeddable in an iframe — no Browserbase login required.
-    async getLiveViewUrl() {
-        const sessionId = this.stagehand.browserbaseSessionID;
-        if (!sessionId) return null;
-        try {
-            const bb    = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
-            const debug = await bb.sessions.debug(sessionId);
-            // debuggerFullscreenUrl works in an iframe without auth
-            return debug.debuggerFullscreenUrl || null;
-        } catch (err) {
-            console.error('[human] failed to get live view url:', err.message);
-            return null;
+    // ── Steel live view URL ───────────────────────────────────────────────────
+    // Uses session.debugUrl with interactive=true — publicly embeddable in an
+    // iframe, no Steel login required. Full click/scroll/type interaction.
+    getLiveViewUrl() {
+        const debugUrl = this.steelSession?.debugUrl;
+        if (!debugUrl) return null;
+        return `${debugUrl}?interactive=true&showControls=true`;
+    }
+
+    // ── Build Steel sessionContext from query.cookies ─────────────────────────
+    // query.cookies can be:
+    //   A) Array of cookie objects (Playwright/Steel format):
+    //      [{ name, value, domain, path, ... }, ...]
+    //   B) Raw document.cookie string:
+    //      "cookie1=value1; cookie2=value2"
+    //   C) Not provided — returns null (fresh session, no cookies injected)
+    _buildSessionContext() {
+        const raw = _.get(this.query, 'cookies', null);
+        if (!raw) return null;
+
+        let cookies = [];
+
+        if (Array.isArray(raw)) {
+            // Already in correct format
+            cookies = raw;
+        } else if (typeof raw === 'string' && raw.trim()) {
+            // Parse document.cookie string → Steel cookie objects
+            // Domain is required — read from query.cookieDomain or derive from query
+            const domain = _.get(this.query, 'cookieDomain', null);
+            cookies = raw.split(';')
+                .map(c => c.trim())
+                .filter(Boolean)
+                .map(c => {
+                    const eqIdx = c.indexOf('=');
+                    if (eqIdx === -1) return null;
+                    return {
+                        name:   c.slice(0, eqIdx).trim(),
+                        value:  c.slice(eqIdx + 1).trim(),
+                        domain: domain || '',
+                        path:   '/',
+                    };
+                })
+                .filter(Boolean);
         }
+
+        if (!cookies.length) return null;
+
+        console.log(`[human] injecting ${cookies.length} cookies into Steel session`);
+        return { cookies };
     }
 
     async _ensurePageReady() {
@@ -132,19 +172,52 @@ class PropertyScraperHuman {
             .trim().replace(/\s+/g, '_').toUpperCase();
         let state  = _.get(this.query, 'state', 'unknown');
 
+        // ── 1. Create Steel session ───────────────────────────────────────────
+        // timeout: 1hour — Steel default is only 5 min, too short for human interaction.
+        // sessionContext: injects cookies from the user's local browser so the
+        // cloud session picks up existing auth/session state on the target site.
+        const sessionContext = this._buildSessionContext();
+
+        this.steelSession = await this.steel.sessions.create({
+            useProxy:     false,
+            solveCaptcha: false,
+            timeout:      1 * 60 * 60 * 1000, // 1 hour in ms (default is only 5 min)
+            ...(sessionContext ? { sessionContext } : {}),
+        });
+        console.log(`[human] Steel session created: ${this.steelSession.id}`);
+        console.log(`[human] live view: ${this.steelSession.sessionViewerUrl}`);
+
+        // ── 2. Connect Stagehand to Steel session via CDP ─────────────────────
+        // Steel exposes a WebSocket endpoint — Stagehand connects as LOCAL env
+        // with cdpUrl pointing to the Steel session. API key is appended to the
+        // websocketUrl for authentication.
+        this.stagehand = new Stagehand({
+            env:          'LOCAL',
+            verbose:       1,
+            enableCaching: true,
+            model:         this._stagehandModel,
+            localBrowserLaunchOptions: {
+                cdpUrl: `${this.steelSession.websocketUrl}&apiKey=${process.env.STEEL_API_KEY}`,
+            },
+        });
         await this.stagehand.init();
 
-        // Fetch the live view URL as soon as the session is ready and
-        // broadcast it so Laravel can show the iframe immediately —
-        // before the first [stagehand][handoff] is even reached.
-        const initialLiveViewUrl = await this.getLiveViewUrl();
-        if (initialLiveViewUrl) {
-            console.log(`[human] session live view: ${initialLiveViewUrl}`);
-            await this.onSessionReady({ liveViewUrl: initialLiveViewUrl });
+        // ── 3. Broadcast live URL immediately ─────────────────────────────────
+        // Steel's debugUrl + ?interactive=true&showControls=true is publicly
+        // embeddable in an iframe — no Steel login required. Laravel shows this
+        // to the user from the moment the session starts so they can monitor
+        // the bot and take over at any time via POST /jobs/:id/takeover.
+        const liveViewUrl = this.getLiveViewUrl();
+        const sessionId   = this.steelSession.id;
+        if (liveViewUrl) {
+            console.log(`[human] session live view: ${liveViewUrl}`);
+            await this.onSessionReady({ liveViewUrl, sessionId });
         }
 
-        // Listen for takeover signal from POST /jobs/:id/takeover
-        // The emitter is attached to the job record in jobStore
+        // ── 4. Listen for takeover signal ─────────────────────────────────────
+        // When Laravel calls POST /jobs/:id/takeover, the emitter fires 'takeover'
+        // which sets takeoverRequested = true. The executeActions loop checks this
+        // flag between actions and pauses (same as [stagehand][handoff]).
         if (this.onTakeoverSignal) {
             this.onTakeoverSignal(() => {
                 console.log('[human] takeover requested — will pause after current action');
@@ -187,19 +260,16 @@ class PropertyScraperHuman {
     }
 
     async closeProcess() {
-        // Close Stagehand (disconnects Playwright)
+        // Close Stagehand (disconnects Playwright from Steel)
         await this.stagehand?.close().catch(() => {});
 
-        // Explicitly stop the Browserbase session so it doesn't keep running
-        // and burning session minutes after the scraper is done.
-        const sessionId = this.stagehand?.browserbaseSessionID;
-        if (sessionId) {
+        // Release the Steel session so it stops and doesn't consume session time
+        if (this.steelSession?.id) {
             try {
-                const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
-                await bb.sessions.stop(sessionId);
-                console.log(`[human] Browserbase session stopped: ${sessionId}`);
+                await this.steel.sessions.release(this.steelSession.id);
+                console.log(`[human] Steel session released: ${this.steelSession.id}`);
             } catch (err) {
-                console.error('[human] failed to stop Browserbase session:', err.message);
+                console.error('[human] failed to release Steel session:', err.message);
             }
         }
     }
@@ -484,11 +554,93 @@ class PropertyScraperHuman {
                 el.click();
             }, payload);
         }
+            // [page][spaclick] <selector>
+            // Reliable click for SPAs — tries 4 strategies in order:
+            //   1. Playwright locator .click() — handles scroll-into-view + wait
+            //   2. dispatchEvent with bubbling mousedown/mouseup/click
+            //   3. Pointer events (pointerdown/pointerup/click)
+            //   4. Direct .click() on the element
+        // Use this when [stagehand][act] or [page][clickselector] don't work.
+        else if (verbKey === 'spaclick') {
+            const selector = payload;
+            console.log('[spaclick] attempting:', selector);
+
+            // Strategy 1: Playwright native click (scroll into view, wait for stable)
+            try {
+                const locator = this.page.locator(selector).first();
+                await locator.waitFor({ state: 'visible', timeout: 5000 });
+                await locator.click({ force: true, timeout: 5000 });
+                console.log('[spaclick] strategy 1 (playwright) succeeded');
+            } catch (e1) {
+                console.log('[spaclick] strategy 1 failed:', e1.message);
+
+                // Strategy 2: dispatch full mouse event sequence with bubbling
+                const s2 = await this.page.evaluate((sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return { ok: false, reason: 'element not found' };
+                    const rect = el.getBoundingClientRect();
+                    const cx   = rect.left + rect.width  / 2;
+                    const cy   = rect.top  + rect.height / 2;
+                    const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
+                    el.dispatchEvent(new MouseEvent('mousedown', opts));
+                    el.dispatchEvent(new MouseEvent('mouseup',   opts));
+                    el.dispatchEvent(new MouseEvent('click',     opts));
+                    return { ok: true };
+                }, selector);
+
+                if (s2.ok) {
+                    console.log('[spaclick] strategy 2 (mouse events) succeeded');
+                } else {
+                    console.log('[spaclick] strategy 2 failed:', s2.reason);
+
+                    // Strategy 3: pointer events (React/Vue often use these)
+                    const s3 = await this.page.evaluate((sel) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return { ok: false };
+                        const rect = el.getBoundingClientRect();
+                        const cx   = rect.left + rect.width  / 2;
+                        const cy   = rect.top  + rect.height / 2;
+                        const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
+                        el.dispatchEvent(new PointerEvent('pointerdown', opts));
+                        el.dispatchEvent(new PointerEvent('pointerup',   opts));
+                        el.dispatchEvent(new MouseEvent('click',         opts));
+                        return { ok: true };
+                    }, selector);
+
+                    if (s3.ok) {
+                        console.log('[spaclick] strategy 3 (pointer events) succeeded');
+                    } else {
+                        // Strategy 4: direct .click() fallback
+                        await this.page.evaluate((sel) => {
+                            const el = document.querySelector(sel);
+                            if (!el) throw new Error('Element not found: ' + sel);
+                            el.click();
+                        }, selector);
+                        console.log('[spaclick] strategy 4 (direct click) succeeded');
+                    }
+                }
+            }
+        }
         else if (verbKey === 'waitfornavigation') {
             const ms = parseInt(payload) || 3000;
             await new Promise(r => setTimeout(r, ms));
             const pages = this.stagehand.context.pages();
             this.page = pages[pages.length - 1];
+        }
+            // [page][waitforselector] <selector>
+        // Wait until a selector is visible — useful after SPA route changes
+        else if (verbKey === 'waitforselector') {
+            await this.page.locator(payload).first().waitFor({ state: 'visible', timeout: 30000 });
+            console.log('[waitforSelector] visible:', payload);
+        }
+            // [page][scrollintoview] <selector>
+        // Scroll element into view — some SPAs only render rows when visible
+        else if (verbKey === 'scrollintoview') {
+            await this.page.evaluate((sel) => {
+                const el = document.querySelector(sel);
+                if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }, payload);
+            await this.page.waitForTimeout(500);
         }
         else if (verbKey === 'downloadiframesrc') {
             const pdfInfo = await this.page.evaluate(() => {

@@ -67,14 +67,17 @@ function getEmitter(jobId) {
 }
 
 function serialize(job) {
+    // Redis hset doesn't store null — convert null to empty string sentinel '__null__'
+    const n = (v) => (v === null || v === undefined) ? '__null__' : v;
     return {
         id:          job.id,
         scraper:     job.scraper,
         status:      job.status,
-        liveViewUrl: job.liveViewUrl  ?? null,
-        webhookUrl:  job.webhookUrl   ?? null,
-        result:      job.result ? JSON.stringify(job.result) : null,
-        error:       job.error        ?? null,
+        liveViewUrl: n(job.liveViewUrl),
+        sessionId:   n(job.sessionId),
+        webhookUrl:  n(job.webhookUrl),
+        result:      job.result ? JSON.stringify(job.result) : '__null__',
+        error:       n(job.error),
         createdAt:   job.createdAt instanceof Date
             ? job.createdAt.toISOString()
             : job.createdAt,
@@ -86,11 +89,15 @@ function serialize(job) {
 
 function deserialize(raw) {
     if (!raw) return null;
+    // Restore null from sentinel '__null__' or legacy 'null' or empty string
+    const n = (v) => (!v || v === '__null__' || v === 'null') ? null : v;
     return {
         ...raw,
-        result:      raw.result ? JSON.parse(raw.result) : null,
-        liveViewUrl: raw.liveViewUrl === 'null' ? null : raw.liveViewUrl,
-        error:       raw.error       === 'null' ? null : raw.error,
+        result:        n(raw.result) ? JSON.parse(raw.result) : null,
+        liveViewUrl:   n(raw.liveViewUrl),
+        sessionId:     n(raw.sessionId),
+        webhookUrl:    n(raw.webhookUrl),
+        error:         n(raw.error),
         resumeEmitter: getEmitter(raw.id),
     };
 }

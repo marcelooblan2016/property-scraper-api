@@ -52,8 +52,8 @@ async function runScraper(job, query) {
          * Updates the job with liveViewUrl so Laravel can show the iframe
          * immediately, before the first [stagehand][handoff] is reached.
          */
-        onSessionReady: async ({ liveViewUrl }) => {
-            await updateJob(job.id, { liveViewUrl });
+        onSessionReady: async ({ liveViewUrl, sessionId }) => {
+            await updateJob(job.id, { liveViewUrl, sessionId });
             console.log(`[job:${job.id}] session ready | liveViewUrl: ${liveViewUrl}`);
         },
 
@@ -142,16 +142,16 @@ async function runScraper(job, query) {
         // Session is ending — clear liveViewUrl since the browser is gone
         await updateJob(job.id, { liveViewUrl: null });
 
-        // Safety net — ensure Browserbase session is stopped even if scraper throws
+        // Safety net — release Steel session even if scraper throws
         if (job.scraper === 'human') {
-            const sessionId = instance.stagehand?.browserbaseSessionID;
-            if (sessionId) {
+            const steelSessionId = instance.steelSession?.id;
+            if (steelSessionId) {
                 try {
-                    const Browserbase = require('@browserbasehq/sdk').default;
-                    const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
-                    await bb.sessions.stop(sessionId);
-                    console.log(`[job:${job.id}] Browserbase session force-stopped: ${sessionId}`);
-                } catch { /* already stopped — ignore */ }
+                    const Steel = require('steel-sdk').default;
+                    const steel = new Steel({ steelAPIKey: process.env.STEEL_API_KEY });
+                    await steel.sessions.release(steelSessionId);
+                    console.log(`[job:${job.id}] Steel session force-released: ${steelSessionId}`);
+                } catch { /* already released — ignore */ }
             }
         }
     }

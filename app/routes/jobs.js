@@ -98,7 +98,28 @@ router.post('/:id/takeover', async (req, res) => {
     return res.json({ ok: true, message: 'Takeover requested — bot will pause after current action' });
 });
 
-// ── POST /jobs/:id/cancel ─────────────────────────────────────────────────────
+// ── GET /jobs/:id/debug ───────────────────────────────────────────────────────
+// Returns Steel session viewer URL for the human to monitor/interact.
+router.get('/:id/debug', async (req, res) => {
+    const job = await getJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    if (!['running', 'waiting'].includes(job.status)) {
+        return res.status(409).json({ error: `Job is not active (status: ${job.status})` });
+    }
+
+    if (!job.sessionId) {
+        return res.status(404).json({ error: 'Session not ready yet — try again in a moment' });
+    }
+
+    return res.json({
+        jobId:       job.id,
+        status:      job.status,
+        // Open this URL in a browser for full native interaction via WebRTC
+        liveViewUrl: job.liveViewUrl,
+        sessionId:   job.sessionId,
+    });
+});
 router.post('/:id/cancel', async (req, res) => {
     const job = await getJob(req.params.id);
     if (!job) return res.status(404).json({ error: 'Job not found' });
