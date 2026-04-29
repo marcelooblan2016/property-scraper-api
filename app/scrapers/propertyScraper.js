@@ -12,11 +12,12 @@ dotenv.config();
 
 class PropertyScraper {
 
-    constructor({ query, standalone = false, onComplete, onError }) {
+    constructor({ query, standalone = false, onComplete, onError, logger }) {
         this.query      = query;
         this.standalone = standalone; // true = CLI (can process.exit), false = Express (must not)
         this.onComplete = onComplete || (async () => {});
         this.onError    = onError    || (async () => {});
+        this.logger     = logger     || null;
 
         const OPENAI_API_KEY    = process.env.SAM_SCRAPER_OPENAI_API_KEY;
         const OPENAI_MODEL      = process.env.SAM_SCRAPER_OPENAI_MODEL;
@@ -36,7 +37,7 @@ class PropertyScraper {
                 ? `anthropic/${ANTHROPIC_MODEL}`
                 : `openai/${OPENAI_MODEL}`,
             localBrowserLaunchOptions: {
-                headless:        false,
+                headless:        true,
                 acceptDownloads: true,
                 downloadsPath:   path.resolve('./downloads'),
             },
@@ -193,6 +194,50 @@ class PropertyScraper {
         }
     }
 
+    // ── logging helper ────────────────────────────────────────────────────────
+    _log(type, message) {
+        if (this.logger) {
+            this.logger[type]?.(message);
+        }
+    }
+
+    // ── human-readable action message ─────────────────────────────────────────
+    _actionMessage(target, verb, payload) {
+        const t = target.toLowerCase();
+        const v = verb.toLowerCase();
+
+        if (t === 'page') {
+            if (v === 'goto')            return `Navigating to ${payload}`;
+            if (v === 'waitfor')         return `Waiting ${payload}ms`;
+            if (v === 'clickselector')   return `Clicking selector: ${payload}`;
+            if (v === 'clickimgbutton')  return `Clicking image button: ${payload || 'first'}`;
+            if (v === 'clickrowelement') return `Clicking row element: ${payload}`;
+            if (v === 'downloadiframesrc') return `Downloading document PDF`;
+            if (v === 'press')           return `Pressing key: ${payload}`;
+            if (v === 'execute')         return `Executing script`;
+            if (v === 'spaclick')        return `Clicking (SPA): ${payload}`;
+            if (v === 'waitforselector') return `Waiting for element: ${payload}`;
+        }
+        if (t === 'stagehand') {
+            if (v === 'act')             return `AI action: ${payload}`;
+            if (v === 'observe')         return `AI observe: ${payload}`;
+            if (v === 'handoff')         return `Waiting for human: ${payload}`;
+            if (v === 'snapshot')        return `Taking screenshot`;
+            if (v === 'waitforurl')      return `Waiting for URL: ${payload}`;
+            if (v === 'switchtonewpage') return `Switching to new tab`;
+            if (v === 'catchpdfurl')     return `Watching for PDF URL`;
+            if (v === 'downloadcaughtpdf') return `Downloading caught PDF`;
+            if (v === 'clickdownload')   return `Downloading from new tab`;
+        }
+        if (t === 'human') {
+            if (v === 'pause')   return `Paused: ${payload}`;
+            if (v === 'prompt')  return `Prompting user: ${payload}`;
+            if (v === 'confirm') return `Confirming: ${payload}`;
+        }
+
+        return `${target}[${verb}]: ${payload}`;
+    }
+
     async executeActions(actions = []) {
         if (!this.page) await this._ensurePageReady();
 
@@ -275,6 +320,9 @@ class PropertyScraper {
             const [, target, verb, rest] = m;
             const payload = rest.trim();
             const verbKey = verb.toLowerCase();
+
+            // Log the action
+            this._log('action', this._actionMessage(target, verb, payload));
 
             try {
                 if (target.toLowerCase() === 'page') {
@@ -664,22 +712,20 @@ class PropertyScraper {
                         });
                     }
                     else if (verbKey === 'downloadcaughtpdf') {
-                        try {
-                            const { url: pdfUrl, pwContext } = await Promise.race([
-                                this.pdfUrlPromise,
-                                new Promise((_, reject) => setTimeout(() => reject(new Error('PDF URL catch timeout')), 30000)),
-                            ]);
-                            const cookies      = await pwContext.cookies();
-                            const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-                            const response     = await fetch(pdfUrl, { headers: { 'Cookie': cookieHeader } });
-                            if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
-                            const buffer = Buffer.from(await response.arrayBuffer());
-                            const dir    = path.dirname(payload);
-                            await fs.promises.mkdir(dir, { recursive: true });
-                            await fs.promises.writeFile(path.resolve(payload), buffer);
-                            this.pdfUrlPromise = null;
-                            console.log('[download] saved to:', path.resolve(payload));
-                        } catch (err) { console.error('downloadcaughtpdf failed:', err); }
+                        const { url: pdfUrl, pwContext } = await Promise.race([
+                            this.pdfUrlPromise,
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('PDF URL catch timeout')), 30000)),
+                        ]);
+                        const cookies      = await pwContext.cookies();
+                        const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+                        const response     = await fetch(pdfUrl, { headers: { 'Cookie': cookieHeader } });
+                        if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
+                        const buffer = Buffer.from(await response.arrayBuffer());
+                        const dir    = path.dirname(payload);
+                        await fs.promises.mkdir(dir, { recursive: true });
+                        await fs.promises.writeFile(path.resolve(payload), buffer);
+                        this.pdfUrlPromise = null;
+                        console.log('[download] saved to:', path.resolve(payload));
                     }
                     else if (verbKey === 'downloadfromhiddenurl') {
                         await new Promise(r => setTimeout(r, 2000));
@@ -709,7 +755,13 @@ class PropertyScraper {
                 }
             } catch (err) {
                 console.error('Action failed:', raw, err);
+                this.logger?.internal(line, 'error', err.message);
+                try { await this.page.waitForTimeout(200); } catch { /* page closed */ }
+                continue;
             }
+
+            // Only reaches here if no error was thrown
+            this.logger?.internal(line, 'ok');
 
             try { await this.page.waitForTimeout(200); } catch { /* page closed */ }
         }

@@ -2,3 +2,33 @@ OH, OTTAWA
 RITCH, ROXANNE
 Book & Page 2047-483
 node index.js --propertyId=888888 --ownerLastName="RITCH" --ownerFirstName="ROXANNE" --county="OTTAWA" --state="OH" --book="2047" --page="483"
+
+
+
+curl -X POST http://localhost:4000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer supersecret" \
+  -d '{
+    "scraper": "bot",
+    "query": {
+      "propertyId": "888888",
+      "ownerLastName": "RITCH",
+      "ownerFirstName": "ROXANNE",
+      "book": "2047",
+      "page": "483",
+      "county": "OTTAWA",
+      "state": "OH"
+    },
+    "webhookUrl": null
+  }'
+
+
+
+curl http://localhost:4000/jobs/db9abe21-0aee-4087-9f35-16693044d195 -H "Authorization: Bearer supersecret"
+
+
+curl http://localhost:4000/jobs/61584fda-9081-47e9-acc7-477e1b4b15ed/debug -H "Authorization: Bearer supersecret"
+
+
+curl -X POST http://localhost:4000/jobs/ba0c0478-6c81-4c32-b22e-b70f92b226eb/resume \
+  -H "Authorization: Bearer supersecret"

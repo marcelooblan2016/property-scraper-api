@@ -15,6 +15,8 @@
 const { Router }      = require('express');
 const { v4: uuid }    = require('uuid');
 const EventEmitter    = require('events');
+const fs              = require('fs');
+const path            = require('path');
 const { createJob, getJob, updateJob, listJobs, serializeJob, signalJob } = require('../store/jobStore');
 const { runScraper }  = require('../functions/jobRunner');
 const { fireWebhook } = require('../functions/webhook');
@@ -36,6 +38,7 @@ router.post('/', async (req, res) => {
         liveViewUrl:   null,
         resumeEmitter: new EventEmitter(), // stored locally, not in Redis
         webhookUrl,
+        propertyId:    query.propertyId || null,
         result:        null,
         error:         null,
         createdAt:     new Date(),
@@ -131,6 +134,60 @@ router.post('/:id/cancel', async (req, res) => {
     await signalJob(job.id, 'cancel');
     await updateJob(job.id, { status: 'cancelled' });
     return res.json({ ok: true });
+});
+
+// ── GET /jobs/:id/logs ────────────────────────────────────────────────────────
+// Returns the log file contents for a job (today's log by default)
+router.get('/:id/logs', async (req, res) => {
+    const job = await getJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    const propertyId = job.propertyId || req.query.propertyId || job.id;
+    const date       = req.query.date || new Date().toISOString().slice(0, 10);
+    const logFile    = path.resolve(`./logs/${propertyId}/property.log`);
+
+    try {
+        const content = await fs.promises.readFile(logFile, 'utf8');
+        const lines   = content.trim().split('\n').map(line => {
+            const match = line.match(/^\[(.+?)\] \[(.+?)\] (.+)$/);
+            if (!match) return { raw: line };
+            return { timestamp: match[1], type: match[2].toLowerCase(), message: match[3] };
+        });
+        return res.json({ jobId: job.id, propertyId, lines });
+    } catch {
+        return res.json({ jobId: job.id, propertyId, lines: [] });
+    }
+});
+
+// ── GET /jobs/:id/logs/internal ───────────────────────────────────────────────
+// Returns the internal debug log (action + response pairs) for investigation
+router.get('/:id/logs/internal', async (req, res) => {
+    const job = await getJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    const propertyId = job.propertyId || req.query.propertyId || job.id;
+    const date       = req.query.date || new Date().toISOString().slice(0, 10);
+    const logFile    = path.resolve(`./logs/${propertyId}/property-internal.log`);
+
+    try {
+        const content = await fs.promises.readFile(logFile, 'utf8');
+        const blocks  = content.split('---\n').filter(b => b.trim());
+        const entries = blocks.map(block => {
+            const lines    = block.trim().split('\n');
+            const header   = lines[0]?.match(/^\[(.+?)\] \[(.+?)\]$/);
+            const action   = lines[1]?.replace('Action:   ', '').trim();
+            const response = lines[2]?.replace('Response: ', '').trim();
+            return {
+                timestamp: header?.[1] || '',
+                status:    header?.[2]?.toLowerCase() === 'error' ? 'error' : 'ok',
+                action:    action || '',
+                response:  response || '',
+            };
+        });
+        return res.json({ jobId: job.id, propertyId, entries });
+    } catch {
+        return res.json({ jobId: job.id, propertyId, entries: [] });
+    }
 });
 
 module.exports = router;

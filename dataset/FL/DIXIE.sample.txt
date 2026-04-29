@@ -1,0 +1,38 @@
+https://titlesearch.afxllc.com/projects/375348
+FL, DIXIE
+SANDERS, DAVID L
+Book & Page: 390-67
+node index.js --propertyId=375348 --ownerLastName="SANDERS" --ownerFirstName="DAVID" --county="DIXIE" --state="FL" --book="390" --page="67"
+
+
+curl -X POST http://localhost:4000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer supersecret" \
+  -d '{
+    "scraper": "human",
+    "query": {
+      "propertyId": "375348",
+      "ownerLastName": "SANDERS",
+      "ownerFirstName": "DAVID",
+      "book": "390",
+      "page": "67",
+      "county": "DIXIE",
+      "state": "FL",
+      "cookieDomain": ".myfloridacounty.com",
+      "cookies": "X2ZicD1mYi4xLjE3NzI4Nzk2MzQwODguODA1Mzk5Mzc1NDM5MjQ5MzA7IGFudGhyb3BpYy1kZXZpY2UtaWQ9MmFhODk0MjQtMjI1Ny00Y2JmLTgyOWQtNTA4NjgzYTc5MzVmOyBhcHAtc2hlbGwtbW9kZT1nYXRlLWRpc2FibGVkOyBDSC1wcmVmZXJzLWNvbG9yLXNjaGVtZT1kYXJrOyBjb29raWVfc2VlZF9kb25lPTE7IGFqc191c2VyX2lkPTRkNWZjNDQ1LWRmOGEtNGFhYi05ZGJkLWFkNWY5MzkyYWQ1ZDsgX19zc2lkPTUyOTE4NWQ5LWUzMzItNGJiMi05MWNmLTQ4M2U0ZWY2ZmE3NTsgZ19zdGF0ZT17ImlfbCI6MCwiaV9sbCI6MTc3Mjg3OTYzMzg0NywiaV9lIjp7ImVuYWJsZV9pdHBfb3B0aW1pemF0aW9uIjowfX07IGxhc3RBY3RpdmVPcmc9ZjRkMmIwOTAtNTQ5Yi00ZGYxLWI5YjgtMGRlYTcxNDI5Y2VlOyBhanNfYW5vbnltb3VzX2lkPWNsYXVkZWFpLnYxLjVmZjE1YjI2LTM5YzAtNDg0OC05MGViLTNkNTllZGFjYzY2ODsgaW50ZXJjb20tZGV2aWNlLWlkLWx1cGs4enlvPWU5NTVkZDlkLTkxZjktNDY1MC05ZTNhLTIyN2RkMGM0ODhjYjsgdXNlci1zaWRlYmFyLXBpbm5lZD1mYWxzZTsgX2djbF9hdT0xLjEuMjI5ODY1MjA5LjE3NzQyOTY3Mzk7IHNlc3Npb25LZXlMQz0xNzc1NzgwNzIyNDg3OyBfX3N0cmlwZV9taWQ9YTAzOTE0NDgtOTMxMi00ODc3LWI1NzgtZDQ4ZmRiN2Q1MWMwMzNmMGI1OyBhY3Rpdml0eVNlc3Npb25JZD00M2RjYTdjZi1mZjU5LTRhZTgtOTI0Yi05YmUzZGUzZTdiOTk7IGludGVyY29tLXNlc3Npb24tbHVwazh6eW89UVZORGVHWXJaMDF1ZUVaU09HOWlZVzh6T1VjMlVXOHhRV2xRYUZnMGJsWTVWRUUwYXl0WFNGWkhibkpvVEhwRk1IQTBkVlJrT1N0Rk1rcEpjbVk1Vmpabk4ySjFja3RpT1VKRWMwZG5XUzh2VUZOVFRXVjFVbTFCVFdwalNsY3hURlJzTm0xQmJUWXlOSGxIWWxKR1owUjFRa2RMZVZCUmFtWkliVmsyTm5CWFlVZEdia2xoUVZaT1ZVRlNSbTVDYTBsMVVWRlVTa001WnpKcWVXeFhUMjVyTDFaYU9VcHJLM2xVTW5CRlozTTRaR00xYTJJMVNrMU5Va2RJU2xSRmQzcFJUMGhGVmtJNFFrWjJkSGRrVW1OeVZVeHJWbVJZYTNSd2N5dE1kbTloZFdscVVucHpaMDl3VkhsS2FYQjBaMkV4TUUxeUwzZFJTalZvUlM5UVRqRTFUMjlrZUdaeVowVjFjekY1YnpGTE5YZHdPRGhOYkZBMU4yNDRTRkJWVFhaS1UyaFlhR2xPYkhNOUxTMVRTMWxUUWpkek5YRndaVTl1VTJKVVJuWjVXU3QzUFQwPS0tZDIwYWRkYjg2ZjlkZTkwZTBiOTc1NDcwNDAzYTA2MTM4MjA0ZGZkZjsgdXNlci1zaWRlYmFyLXZpc2libGUtb24tbG9hZD1mYWxzZTsgX2RkX3M9YWlkPTBiZTRhZjg0LWM2MjEtNDkxMy05YzRmLWU4NWJmNDZjOGVlYSZydW09MiZpZD0xMmQ0NTFjZC04NGYyLTRlZjQtYTU5Ny00YmQwYzFlYTI3M2YmY3JlYXRlZD0xNzc3NDIxNjIzMTM1JmV4cGlyZT0xNzc3NDI1OTE4MDc4",
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Safari/537.36",
+      "cloudBrowser": "browserbase"
+    },
+    "webhookUrl": null
+  }'
+
+
+
+curl http://localhost:4000/jobs/01086893-e4f2-42f5-ae7e-fe52ce4a5fc0 -H "Authorization: Bearer supersecret"
+
+
+curl http://localhost:4000/jobs/61584fda-9081-47e9-acc7-477e1b4b15ed/debug -H "Authorization: Bearer supersecret"
+
+
+curl -X POST http://localhost:4000/jobs/ba0c0478-6c81-4c32-b22e-b70f92b226eb/resume \
+  -H "Authorization: Bearer supersecret"

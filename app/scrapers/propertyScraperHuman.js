@@ -35,6 +35,7 @@
 
 const { Stagehand }  = require('@browserbasehq/stagehand');
 const Steel          = require('steel-sdk').default;
+const Browserbase    = require('@browserbasehq/sdk').default;
 const dotenv         = require('dotenv');
 const _              = require('lodash');
 const fs             = require('fs');
@@ -60,13 +61,14 @@ class PropertyScraperHuman {
      * @param {string}       options.query.cookieDomain — domain for cookie injection (optional)
      * @param {object}       options.query.confirmOverrides — map of confirm questions → bool
      */
-    constructor({ query, onHandoff, onComplete, onError, onTakeoverSignal, onSessionReady }) {
+    constructor({ query, onHandoff, onComplete, onError, onTakeoverSignal, onSessionReady, logger }) {
         this.query             = query;
         this.onHandoff         = onHandoff        || (async () => {});
         this.onComplete        = onComplete       || (async () => {});
         this.onError           = onError          || (async () => {});
         this.onSessionReady    = onSessionReady   || (async () => {}); // fired once Steel session is live — sets liveViewUrl on the job
         this.onTakeoverSignal  = onTakeoverSignal || null;
+        this.logger            = logger           || null;
 
         const ANTHROPIC_API_KEY = process.env.SAM_SCRAPER_ANTHROPIC_API_KEY;
         const ANTHROPIC_MODEL   = process.env.SAM_SCRAPER_ANTHROPIC_MODEL;
@@ -77,17 +79,33 @@ class PropertyScraperHuman {
         process.env.ANTHROPIC_API_KEY = ANTHROPIC_API_KEY;
         process.env.OPENAI_API_KEY    = OPENAI_API_KEY;
 
-        // Steel client — manages session lifecycle (create, release)
-        this.steel        = new Steel({ steelAPIKey: process.env.STEEL_API_KEY });
-        this.steelSession = null; // set in startNow() after Steel session is created
+        // ── Cloud browser provider ────────────────────────────────────────────
+        // Controlled via CLOUD_BROWSER env var or query.cloudBrowser per-job.
+        // Options:
+        //   'steel'       (default) — Steel.dev cloud browser
+        //   'browserbase'           — Browserbase cloud browser
+        //   'novnc'                 — Real Chrome on DO droplet via CDP
+        //                            Requires setup-novnc.sh to be run first.
+        //                            Human sees Chrome via noVNC web viewer.
+        //                            Best for Cloudflare-protected sites.
+        this.provider = (
+            _.get(this.query, 'cloudBrowser') ||
+            process.env.CLOUD_BROWSER ||
+            'steel'
+        ).toLowerCase();
 
-        // Stagehand connects to the Steel session via CDP using env: LOCAL + cdpUrl.
-        // The cdpUrl is built in startNow() once the Steel session websocketUrl is known.
+        console.log(`[human] cloud browser provider: ${this.provider}`);
+
+        // Steel client
+        this.steel        = new Steel({ steelAPIKey: process.env.STEEL_API_KEY });
+        this.steelSession = null;
+
+        // Stagehand — initialised in startNow() after session is created
         this._stagehandModel = useAnthropic
             ? `anthropic/${ANTHROPIC_MODEL}`
             : `openai/${OPENAI_MODEL}`;
 
-        this.stagehand = null; // initialised in startNow() after Steel session is ready
+        this.stagehand = null;
 
         this.page              = null;
         this.helper            = new helper();
@@ -95,10 +113,30 @@ class PropertyScraperHuman {
         this.takeoverRequested = false;
     }
 
-    // ── Steel live view URL ───────────────────────────────────────────────────
-    // Uses session.debugUrl with interactive=true — publicly embeddable in an
-    // iframe, no Steel login required. Full click/scroll/type interaction.
-    getLiveViewUrl() {
+    // ── Live view URL — provider-aware ────────────────────────────────────────
+    async getLiveViewUrl() {
+        if (this.provider === 'browserbase') {
+            const sessionId = this.stagehand?.browserbaseSessionID;
+            if (!sessionId) return null;
+            try {
+                const bb    = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
+                const debug = await bb.sessions.debug(sessionId);
+                return debug.debuggerFullscreenUrl || null;
+            } catch (err) {
+                console.error('[human] failed to get Browserbase live view url:', err.message);
+                return null;
+            }
+        }
+
+        if (this.provider === 'novnc') {
+            // noVNC web viewer — human opens this in their browser
+            // Human sees and interacts with real Chrome running on the DO droplet
+            const host = process.env.NOVNC_PUBLIC_HOST || 'localhost';
+            const port = process.env.NOVNC_PORT || '6080';
+            return `http://${host}:${port}/vnc.html?autoconnect=true&password=${process.env.NOVNC_PASSWORD || 'changeme'}`;
+        }
+
+        // Steel — debugUrl with interactive=true is publicly embeddable
         const debugUrl = this.steelSession?.debugUrl;
         if (!debugUrl) return null;
         return `${debugUrl}?interactive=true&showControls=true`;
@@ -110,10 +148,25 @@ class PropertyScraperHuman {
     //      [{ name, value, domain, path, ... }, ...]
     //   B) Raw document.cookie string:
     //      "cookie1=value1; cookie2=value2"
-    //   C) Not provided — returns null (fresh session, no cookies injected)
+    //   C) Base64-encoded document.cookie string (recommended for cookies with
+    //      special characters like quotes in JSESSIONID):
+    //      btoa("cookie1=value1; cookie2=value2")
+    //   D) Not provided — returns null (fresh session, no cookies injected)
     _buildSessionContext() {
-        const raw = _.get(this.query, 'cookies', null);
+        let raw = _.get(this.query, 'cookies', null);
         if (!raw) return null;
+
+        // Decode base64 if needed — safe way to pass cookies with special chars
+        if (typeof raw === 'string') {
+            try {
+                const decoded = Buffer.from(raw, 'base64').toString('utf8');
+                // Only use decoded if it looks like a cookie string (contains = )
+                if (decoded.includes('=')) {
+                    console.log('[human] cookies decoded from base64');
+                    raw = decoded;
+                }
+            } catch { /* not base64 — use as-is */ }
+        }
 
         let cookies = [];
 
@@ -121,8 +174,6 @@ class PropertyScraperHuman {
             // Already in correct format
             cookies = raw;
         } else if (typeof raw === 'string' && raw.trim()) {
-            // Parse document.cookie string → Steel cookie objects
-            // Domain is required — read from query.cookieDomain or derive from query
             const domain = _.get(this.query, 'cookieDomain', null);
             cookies = raw.split(';')
                 .map(c => c.trim())
@@ -132,7 +183,8 @@ class PropertyScraperHuman {
                     if (eqIdx === -1) return null;
                     return {
                         name:   c.slice(0, eqIdx).trim(),
-                        value:  c.slice(eqIdx + 1).trim(),
+                        // Strip surrounding quotes Steel doesn't expect
+                        value:  c.slice(eqIdx + 1).trim().replace(/^"|"$/g, ''),
                         domain: domain || '',
                         path:   '/',
                     };
@@ -143,6 +195,7 @@ class PropertyScraperHuman {
         if (!cookies.length) return null;
 
         console.log(`[human] injecting ${cookies.length} cookies into Steel session`);
+        cookies.forEach(c => console.log(`[human]   ${c.name}=${c.value.substring(0, 20)}...`));
         return { cookies };
     }
 
@@ -172,43 +225,98 @@ class PropertyScraperHuman {
             .trim().replace(/\s+/g, '_').toUpperCase();
         let state  = _.get(this.query, 'state', 'unknown');
 
-        // ── 1. Create Steel session ───────────────────────────────────────────
-        // timeout: 1hour — Steel default is only 5 min, too short for human interaction.
-        // sessionContext: injects cookies from the user's local browser so the
-        // cloud session picks up existing auth/session state on the target site.
+        // ── 1. Create cloud browser session ──────────────────────────────────
         const sessionContext = this._buildSessionContext();
 
-        this.steelSession = await this.steel.sessions.create({
-            useProxy:     false,
-            solveCaptcha: false,
-            timeout:      1 * 60 * 60 * 1000, // 1 hour in ms (default is only 5 min)
-            ...(sessionContext ? { sessionContext } : {}),
-        });
-        console.log(`[human] Steel session created: ${this.steelSession.id}`);
-        console.log(`[human] live view: ${this.steelSession.sessionViewerUrl}`);
+        if (this.provider === 'browserbase') {
+            // ── Browserbase ───────────────────────────────────────────────────
+            this.stagehand = new Stagehand({
+                env:           'BROWSERBASE',
+                verbose:       1,
+                enableCaching: true,
+                model:         this._stagehandModel,
+                apiKey:        process.env.BROWSERBASE_API_KEY,
+                projectId:     process.env.BROWSERBASE_PROJECT_ID,
+                browserbaseSessionCreateParams: {
+                    projectId: process.env.BROWSERBASE_PROJECT_ID,
+                    keepAlive: true,
+                },
+            });
+            await this.stagehand.init();
+            console.log(`[human] Browserbase session: ${this.stagehand.browserbaseSessionID}`);
 
-        // ── 2. Connect Stagehand to Steel session via CDP ─────────────────────
-        // Steel exposes a WebSocket endpoint — Stagehand connects as LOCAL env
-        // with cdpUrl pointing to the Steel session. API key is appended to the
-        // websocketUrl for authentication.
-        this.stagehand = new Stagehand({
-            env:          'LOCAL',
-            verbose:       1,
-            enableCaching: true,
-            model:         this._stagehandModel,
-            localBrowserLaunchOptions: {
-                cdpUrl: `${this.steelSession.websocketUrl}&apiKey=${process.env.STEEL_API_KEY}`,
-            },
-        });
-        await this.stagehand.init();
+        } else if (this.provider === 'novnc') {
+            // ── noVNC — real Chrome on DO droplet via CDP ─────────────────────
+            // Chrome must be running with --remote-debugging-port=9222
+            // Run scripts/setup-novnc.sh on the droplet first.
+            const cdpUrl = process.env.NOVNC_CDP_URL || 'http://localhost:9222';
+            console.log(`[human] connecting to Chrome via CDP: ${cdpUrl}`);
 
-        // ── 3. Broadcast live URL immediately ─────────────────────────────────
-        // Steel's debugUrl + ?interactive=true&showControls=true is publicly
-        // embeddable in an iframe — no Steel login required. Laravel shows this
-        // to the user from the moment the session starts so they can monitor
-        // the bot and take over at any time via POST /jobs/:id/takeover.
-        const liveViewUrl = this.getLiveViewUrl();
-        const sessionId   = this.steelSession.id;
+            this.stagehand = new Stagehand({
+                env:           'LOCAL',
+                verbose:       1,
+                enableCaching: true,
+                model:         this._stagehandModel,
+                localBrowserLaunchOptions: {
+                    cdpUrl,
+                },
+            });
+            await this.stagehand.init();
+            console.log('[human] connected to local Chrome via CDP');
+
+        } else {
+            // ── Steel (default) ───────────────────────────────────────────────
+            this.steelSession = await this.steel.sessions.create({
+                useProxy:     _.get(this.query, 'steelUseProxy',     true),
+                solveCaptcha: _.get(this.query, 'steelSolveCaptcha', true),
+                timeout:      1 * 60 * 60 * 1000, // 1 hour
+                ...(sessionContext ? { sessionContext } : {}),
+            });
+            console.log(`[human] Steel session created: ${this.steelSession.id}`);
+            this.logger?.info(`Steel session created: ${this.steelSession.id}`);
+
+            this.stagehand = new Stagehand({
+                env:           'LOCAL',
+                verbose:       1,
+                enableCaching: true,
+                model:         this._stagehandModel,
+                localBrowserLaunchOptions: {
+                    cdpUrl: `${this.steelSession.websocketUrl}&apiKey=${process.env.STEEL_API_KEY}`,
+                },
+            });
+            await this.stagehand.init();
+        }
+
+        // ── 2. Inject Chrome headers (both providers) ─────────────────────────
+        const userAgent = _.get(this.query, 'userAgent',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        );
+        const page = this.stagehand.context.pages()[0];
+        if (page) {
+            await page.setExtraHTTPHeaders({
+                'user-agent':                userAgent,
+                'sec-ch-ua':                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                'sec-ch-ua-mobile':          '?0',
+                'sec-ch-ua-platform':        '"macOS"',
+                'sec-fetch-dest':            'document',
+                'sec-fetch-mode':            'navigate',
+                'sec-fetch-site':            'none',
+                'sec-fetch-user':            '?1',
+                'accept-language':           'en-US,en;q=0.9',
+                'accept':                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'upgrade-insecure-requests': '1',
+            });
+            await this.stagehand.context.setExtraHTTPHeaders({
+                'user-agent': userAgent,
+            });
+            console.log('[human] Chrome headers injected');
+        }
+
+        // ── 3. Broadcast live URL ─────────────────────────────────────────────
+        const liveViewUrl = await this.getLiveViewUrl();
+        const sessionId   = this.provider === 'browserbase'
+            ? this.stagehand?.browserbaseSessionID
+            : this.steelSession?.id;
         if (liveViewUrl) {
             console.log(`[human] session live view: ${liveViewUrl}`);
             await this.onSessionReady({ liveViewUrl, sessionId });
@@ -260,16 +368,31 @@ class PropertyScraperHuman {
     }
 
     async closeProcess() {
-        // Close Stagehand (disconnects Playwright from Steel)
         await this.stagehand?.close().catch(() => {});
 
-        // Release the Steel session so it stops and doesn't consume session time
-        if (this.steelSession?.id) {
-            try {
-                await this.steel.sessions.release(this.steelSession.id);
-                console.log(`[human] Steel session released: ${this.steelSession.id}`);
-            } catch (err) {
-                console.error('[human] failed to release Steel session:', err.message);
+        if (this.provider === 'browserbase') {
+            const sessionId = this.stagehand?.browserbaseSessionID;
+            if (sessionId) {
+                try {
+                    const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
+                    await bb.sessions.stop(sessionId);
+                    console.log(`[human] Browserbase session stopped: ${sessionId}`);
+                } catch (err) {
+                    console.error('[human] failed to stop Browserbase session:', err.message);
+                }
+            }
+        } else if (this.provider === 'novnc') {
+            // noVNC — Chrome keeps running on the droplet, nothing to release
+            console.log('[human] noVNC session closed (Chrome stays running on droplet)');
+        } else {
+            // Steel
+            if (this.steelSession?.id) {
+                try {
+                    await this.steel.sessions.release(this.steelSession.id);
+                    console.log(`[human] Steel session released: ${this.steelSession.id}`);
+                } catch (err) {
+                    console.error('[human] failed to release Steel session:', err.message);
+                }
             }
         }
     }
@@ -300,6 +423,34 @@ class PropertyScraperHuman {
     }
 
     // ── action runner ─────────────────────────────────────────────────────────
+    // ── human-readable action message ─────────────────────────────────────────
+    _actionMessage(target, verb, payload) {
+        const t = target.toLowerCase();
+        const v = verb.toLowerCase();
+        if (t === 'page') {
+            if (v === 'goto')              return `Navigating to ${payload}`;
+            if (v === 'waitfor')           return `Waiting ${payload}ms`;
+            if (v === 'clickselector')     return `Clicking selector: ${payload}`;
+            if (v === 'spaclick')          return `Clicking (SPA): ${payload}`;
+            if (v === 'waitforselector')   return `Waiting for element: ${payload}`;
+            if (v === 'downloadiframesrc') return `Downloading document PDF`;
+            if (v === 'press')             return `Pressing key: ${payload}`;
+        }
+        if (t === 'stagehand') {
+            if (v === 'act')               return `AI action: ${payload}`;
+            if (v === 'observe')           return `AI observe: ${payload}`;
+            if (v === 'snapshot')          return `Taking screenshot`;
+            if (v === 'waitforurl')        return `Waiting for URL: ${payload}`;
+            if (v === 'handoff')           return `Waiting for human: ${payload}`;
+        }
+        if (t === 'human') {
+            if (v === 'pause')             return `Paused: ${payload}`;
+            if (v === 'prompt')            return `Prompting: ${payload}`;
+            if (v === 'confirm')           return `Confirming: ${payload}`;
+        }
+        return `${target}[${verb}]: ${payload}`;
+    }
+
     async executeActions(actions = []) {
         if (!this.page) await this._ensurePageReady();
 
@@ -391,6 +542,16 @@ class PropertyScraperHuman {
             const [, target, verb, rest] = m;
             const payload = rest.trim();
             const t = target.toLowerCase();
+
+            // Log the action
+            if (this.logger) {
+                const v = verb.toLowerCase();
+                if (t === 'stagehand' && v === 'handoff') {
+                    this.logger.handoff(`Waiting for human: ${payload}`);
+                } else {
+                    this.logger.action(this._actionMessage(target, verb, payload));
+                }
+            }
             const v = verb.toLowerCase();
 
             try {
@@ -485,7 +646,13 @@ class PropertyScraperHuman {
 
             } catch (err) {
                 console.error('[human] action failed:', raw, err.message);
+                this.logger?.internal(line, 'error', err.message);
+                try { await this.page.waitForTimeout(200); } catch { /* page closed */ }
+                continue;
             }
+
+            // Only reaches here if no error was thrown
+            this.logger?.internal(line, 'ok');
 
             try { await this.page.waitForTimeout(200); } catch { /* page closed */ }
         }

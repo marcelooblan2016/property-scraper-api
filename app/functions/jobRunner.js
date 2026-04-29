@@ -22,8 +22,10 @@
 
 const { updateJob, getEmitter, redis } = require('../store/jobStore');
 const { fireWebhook }                  = require('./webhook');
+const { JobLogger }                    = require('./logger');
+const logServer                        = require('./logServer');
 
-const HANDOFF_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
+const HANDOFF_TIMEOUT_MS = 1 * 60 * 60 * 1000; // 1 hour — matches Steel session timeout
 
 /**
  * Start a scraper job asynchronously.
@@ -35,6 +37,12 @@ const HANDOFF_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
 async function runScraper(job, query) {
     await updateJob(job.id, { status: 'running' });
     console.log(`[job:${job.id}] starting | scraper=${job.scraper}`);
+
+    // ── create logger ─────────────────────────────────────────────────────────
+    const propertyId = query.propertyId || null;
+    const logger     = new JobLogger(job.id, propertyId, logServer);
+    console.log(`[logger] propertyId: ${propertyId}, logDir: ./logs/${propertyId || job.id}`);
+    logger.info(`Job started | scraper: ${job.scraper}`);
 
     // ── resolve scraper class ─────────────────────────────────────────────────
     let ScraperClass;
@@ -115,43 +123,52 @@ async function runScraper(job, query) {
          */
         onComplete: async ({ filePath, s3Key, s3Url }) => {
             await updateJob(job.id, { status: 'completed', result: { filePath, s3Key, s3Url } });
-            console.log(`[job:${job.id}] completed | s3: ${s3Url || filePath}`);
+            logger.complete(`Job completed | s3: ${s3Url || filePath}`);
             await fireWebhook(job, { status: 'completed', filePath, s3Key, s3Url });
         },
 
-        /**
-         * onTakeoverSignal — registers a callback that fires when the takeover event
-         * is emitted (via POST /jobs/:id/takeover). Only relevant for type2.
-         */
         onTakeoverSignal: (callback) => {
             const emitter = job.resumeEmitter;
             if (emitter) emitter.on('takeover', callback);
         },
+
         onError: async ({ error }) => {
             await updateJob(job.id, { status: 'failed', error });
-            console.error(`[job:${job.id}] failed | ${error}`);
+            logger.error(`Job failed | ${error}`);
             await fireWebhook(job, { status: 'failed', error });
         },
     };
 
     // ── run ───────────────────────────────────────────────────────────────────
-    const instance = new ScraperClass({ query, standalone: false, ...callbacks });
+    const instance = new ScraperClass({ query, standalone: false, logger, ...callbacks });
     try {
         await instance.startNow();
     } finally {
-        // Session is ending — clear liveViewUrl since the browser is gone
         await updateJob(job.id, { liveViewUrl: null });
 
-        // Safety net — release Steel session even if scraper throws
         if (job.scraper === 'human') {
-            const steelSessionId = instance.steelSession?.id;
-            if (steelSessionId) {
-                try {
-                    const Steel = require('steel-sdk').default;
-                    const steel = new Steel({ steelAPIKey: process.env.STEEL_API_KEY });
-                    await steel.sessions.release(steelSessionId);
-                    console.log(`[job:${job.id}] Steel session force-released: ${steelSessionId}`);
-                } catch { /* already released — ignore */ }
+            const provider = instance.provider || 'steel';
+
+            if (provider === 'browserbase') {
+                const sessionId = instance.stagehand?.browserbaseSessionID;
+                if (sessionId) {
+                    try {
+                        const Browserbase = require('@browserbasehq/sdk').default;
+                        const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
+                        await bb.sessions.stop(sessionId);
+                        console.log(`[job:${job.id}] Browserbase session force-stopped: ${sessionId}`);
+                    } catch { /* already stopped */ }
+                }
+            } else {
+                const steelSessionId = instance.steelSession?.id;
+                if (steelSessionId) {
+                    try {
+                        const Steel = require('steel-sdk').default;
+                        const steel = new Steel({ steelAPIKey: process.env.STEEL_API_KEY });
+                        await steel.sessions.release(steelSessionId);
+                        console.log(`[job:${job.id}] Steel session force-released: ${steelSessionId}`);
+                    } catch { /* already released */ }
+                }
             }
         }
     }

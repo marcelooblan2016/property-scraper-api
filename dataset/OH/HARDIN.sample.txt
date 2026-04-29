@@ -20,3 +20,16 @@ curl -X POST http://localhost:4000/jobs \
     },
     "webhookUrl": null
   }'
+
+
+
+curl http://localhost:4000/jobs/67f4931e-3db3-4e91-8ddb-eebb5283db53/logs/internal -H "Authorization: Bearer supersecret"
+
+curl http://localhost:4000/jobs/517a5c4d-18f7-4116-ad39-9d60874defca -H "Authorization: Bearer supersecret"
+
+
+curl http://localhost:4000/jobs/61584fda-9081-47e9-acc7-477e1b4b15ed/debug -H "Authorization: Bearer supersecret"
+
+
+curl -X POST http://localhost:4000/jobs/ba0c0478-6c81-4c32-b22e-b70f92b226eb/resume \
+  -H "Authorization: Bearer supersecret"

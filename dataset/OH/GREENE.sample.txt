@@ -1,4 +1,0 @@
-OH, GREENE
-CAMPBELL & ANDREWS FARMS LLC
-Book & Page 3661-245
-node index.js --propertyId=80880 --ownerLastName="CAMPBELL & ANDREWS FARMS LLC" --county="GREENE" --state="OH" --book="3661" --page="245"
