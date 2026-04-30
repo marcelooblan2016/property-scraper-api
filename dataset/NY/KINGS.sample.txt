@@ -3,3 +3,19 @@ SPARKMAN, CAROL
 Block & Lot: 1817-41
 node index.js --propertyId=898989 --ownerLastName="SPARKMAN" --ownerFirstName="CAROL" --county="KINGS" --state="NY" --block="1817" --lot="41"
 
+curl -X POST http://localhost:4000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer supersecret" \
+  -d '{
+    "scraper": "bot",
+    "query": {
+      "propertyId": "898989",
+      "ownerLastName": "SPARKMAN",
+      "ownerFirstName": "CAROL",
+      "county": "KINGS",
+      "state": "NY",
+      "book": "1817",
+      "page": "41"
+    },
+    "webhookUrl": null
+  }'

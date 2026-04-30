@@ -11,6 +11,7 @@
 
 const http    = require('http');
 const express = require('express');
+const cors    = require('cors');
 const path    = require('path');
 const dotenv  = require('dotenv');
 
@@ -23,6 +24,13 @@ const logServer = require('./functions/logServer');
 const app        = express();
 const httpServer = http.createServer(app);
 const PORT       = process.env.NODE_PORT || 4000;
+
+// ── CORS ──────────────────────────────────────────────────────────────────────
+app.use(cors({
+    origin: process.env.CORS_ORIGIN || '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 // ── global middleware ─────────────────────────────────────────────────────────
 app.use(express.json());

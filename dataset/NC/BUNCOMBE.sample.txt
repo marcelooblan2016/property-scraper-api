@@ -2,3 +2,20 @@ NC, BUNCOMBE
 JA VENTURES LLC
 Book & Page 6230-103
 node index.js --propertyId=88991 --ownerLastName="JA VENTURES LLC" --county="BUNCOMBE" --state="NC" --book="6230" --page="103"
+
+curl -X POST http://localhost:4000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer supersecret" \
+  -d '{
+    "scraper": "bot",
+    "query": {
+      "propertyId": "461256",
+      "ownerLastName": "JA VENTURES LLC",
+      "ownerFirstName": "",
+      "county": "BUNCOMBE",
+      "state": "NC",
+      "book": "6230",
+      "page": "103"
+    },
+    "webhookUrl": null
+  }'

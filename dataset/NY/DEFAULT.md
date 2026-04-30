@@ -15,7 +15,8 @@
 [stagehand][observe] the document image has loaded
 [page][waitfor] 3000
 [stagehand][waitfordownload]
-[stagehand][act] click the download icon in the toolbar
+[page][waitfor] 3000
+[page][clickselector] img[src*="save.png"][title="Save"]
 [stagehand][observe] wait for save modal to appear
 [page][waitfor] 5000
 [stagehand][act] click the OK button in the Save dialog
