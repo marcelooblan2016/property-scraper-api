@@ -215,6 +215,8 @@ class PropertyScraper {
             if (v === 'downloadiframesrc') return `Downloading document PDF`;
             if (v === 'press')           return `Pressing key: ${payload}`;
             if (v === 'execute')         return `Executing script`;
+            if (v === 'evaluate')        return `Evaluating: ${payload}`;
+            if (v === 'do')              return `Do: ${payload}`;
             if (v === 'spaclick')        return `Clicking (SPA): ${payload}`;
             if (v === 'waitforselector') return `Waiting for element: ${payload}`;
         }
@@ -236,6 +238,137 @@ class PropertyScraper {
         }
 
         return `${target}[${verb}]: ${payload}`;
+    }
+
+    // ── [page][do] — Puppeteer-style explicit selector commands ──────────────
+    //
+    //  Supported:
+    //    await page.type('#selector', 'text')
+    //    await page.click('selector')
+    //    await page.clickText('visible text')       ← text-based click with wait
+    //    await page.waitForSelector('selector')
+    //    await page.waitForTimeout(ms)
+    //    await page.goto('url')
+    //    await page.select('selector', 'value')     ← dropdown
+    //    await page.focus('selector')
+    //    await page.keyboard.press('Enter')
+    //
+    async _executeDo(raw) {
+        const cmd = raw.trim().replace(/^await\s+/, '');
+        console.log(`[page][do] ${cmd}`);
+
+        // ── page.type('#selector', 'text') ───────────────────────────────
+        const typeMatch = cmd.match(/^page\.type\(\s*(["'`])(.*?)\1\s*,\s*(["'`])(.*?)\3\s*\)/s);
+        if (typeMatch) {
+            const selector = typeMatch[2];
+            const text     = typeMatch[4];
+            await this.page.evaluate((sel, val) => {
+                const el = document.querySelector(sel);
+                if (!el) throw new Error('Element not found: ' + sel);
+                el.focus();
+                el.click();
+                el.value = '';
+                for (const char of val) {
+                    el.value += char;
+                    el.dispatchEvent(new KeyboardEvent('keydown',  { key: char, bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
+                    el.dispatchEvent(new Event('input',            { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keyup',    { key: char, bubbles: true }));
+                }
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }, selector, text);
+            return;
+        }
+
+        // ── page.clickText('visible text') — polls up to 10s then clicks ─
+        const clickTextMatch = cmd.match(/^page\.clickText\(\s*(["'`])(.*?)\1\s*\)/s);
+        if (clickTextMatch) {
+            const text  = clickTextMatch[2];
+            const start = Date.now();
+            let clicked = false;
+            while (Date.now() - start < 10000) {
+                clicked = await this.page.evaluate((t) => {
+                    const el = Array.from(document.querySelectorAll('button,a,[role="button"]'))
+                        .find(e => e.textContent.trim().includes(t));
+                    if (el) { el.click(); return true; }
+                    return false;
+                }, text);
+                if (clicked) break;
+                await new Promise(r => setTimeout(r, 300));
+            }
+            if (!clicked) throw new Error(`No element with text: ${text}`);
+            return;
+        }
+
+        // ── page.click('selector') ───────────────────────────────────────
+        const clickMatch = cmd.match(/^page\.click\(\s*(["'`])(.*?)\1\s*\)/s);
+        if (clickMatch) {
+            const selector = clickMatch[2];
+            await this.page.evaluate((sel) => {
+                const el = document.querySelector(sel);
+                if (!el) throw new Error('Element not found: ' + sel);
+                el.click();
+                return true;
+            }, selector);
+            return;
+        }
+
+        // ── page.waitForSelector('selector') ────────────────────────────
+        const waitSelMatch = cmd.match(/^page\.waitForSelector\(\s*(["'`])(.*?)\1\s*\)/s);
+        if (waitSelMatch) {
+            await this.page.waitForSelector(waitSelMatch[2], { timeout: 15000 });
+            return;
+        }
+
+        // ── page.waitForTimeout(ms) ──────────────────────────────────────
+        const waitTimeMatch = cmd.match(/^page\.waitForTimeout\(\s*(\d+)\s*\)/);
+        if (waitTimeMatch) {
+            await this.page.waitForTimeout(parseInt(waitTimeMatch[1]));
+            return;
+        }
+
+        // ── page.goto('url') ─────────────────────────────────────────────
+        const gotoMatch = cmd.match(/^page\.goto\(\s*(["'`])(.*?)\1\s*\)/s);
+        if (gotoMatch) {
+            await this.page.goto(gotoMatch[2], { waitUntil: 'load' });
+            return;
+        }
+
+        // ── page.select('selector', 'value') — dropdown ──────────────────
+        const selectMatch = cmd.match(/^page\.select\(\s*(["'`])(.*?)\1\s*,\s*(["'`])(.*?)\3\s*\)/s);
+        if (selectMatch) {
+            await this.page.evaluate((sel, val) => {
+                const el = document.querySelector(sel);
+                if (!el) throw new Error('Element not found: ' + sel);
+                el.value = val;
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }, selectMatch[2], selectMatch[4]);
+            return;
+        }
+
+        // ── page.focus('selector') ───────────────────────────────────────
+        const focusMatch = cmd.match(/^page\.focus\(\s*(["'`])(.*?)\1\s*\)/s);
+        if (focusMatch) {
+            await this.page.evaluate((sel) => {
+                const el = document.querySelector(sel);
+                if (!el) throw new Error('Element not found: ' + sel);
+                el.focus();
+                return true;
+            }, focusMatch[2]);
+            return;
+        }
+
+        // ── page.keyboard.press('Key') — native Playwright keyboard ─────
+        const keyMatch = cmd.match(/^page\.keyboard\.press\(\s*(["'`])(.*?)\1\s*\)/s);
+        if (keyMatch) {
+            await this.page.keyboard.press(keyMatch[2]);
+            return;
+        }
+
+        // ── Unrecognised — throw so caller logs the error ────────────────
+        throw new Error(`Unrecognised [page][do] command: ${cmd}`);
     }
 
     async executeActions(actions = []) {
@@ -321,6 +454,12 @@ class PropertyScraper {
             const payload = rest.trim();
             const verbKey = verb.toLowerCase();
 
+            // Re-acquire page before each action — handles navigations, popups, new tabs
+            if (target.toLowerCase() === 'page' && (!this.page || typeof this.page.isClosed === 'function' && this.page.isClosed())) {
+                const pages = this.stagehand.context.pages();
+                this.page = pages[pages.length - 1];
+            }
+
             // Log the action
             this._log('action', this._actionMessage(target, verb, payload));
 
@@ -331,10 +470,20 @@ class PropertyScraper {
                         const url = payload.match(/(https?:\/\/\S+)/)?.[1] || payload.split(/\s+/)[0];
                         await this.page.goto(url, { waitUntil: 'load' });
                     }
-                    else if (verbKey === 'execute') {
+                    else if (verbKey === 'execute' || verbKey === 'evaluate') {
+                        // ── NEW: [page][evaluate] is an alias for [page][execute] ──
                         await this.page.evaluate(payload);
                     }
+                    else if (verbKey === 'do') {
+                        // ── NEW: [page][do] — Puppeteer-style commands ────────────
+                        await this._executeDo(payload);
+                    }
                     else if (verbKey === 'press') {
+                        // Re-acquire page in case it changed (e.g. after navigation or popup)
+                        if (!this.page || (typeof this.page.isClosed === 'function' && this.page.isClosed())) {
+                            const pages = this.stagehand.context.pages();
+                            this.page = pages[pages.length - 1];
+                        }
                         await this.page.keyboard.press(payload);
                     }
                     else if (verbKey === 'waitfor') {

@@ -1,20 +1,17 @@
 [page][goto] https://ava.fidlar.com/NHStrafford/AvaWeb/#/search
+[page][waitfor] 3000
 [if query.isBusinessName==='true']
-[stagehand][act] click the `Business:` radio button
-[stagehand][act] type `${query.ownerLastName}` into the input labeled `Last Name / Business Name` field
+[page][do] await page.type('input[formcontrolname="LastBusinessName"]', "${query.ownerLastName}")
+
 [else]
-[stagehand][act] type `${query.ownerLastName}` into the input labeled `Last Name / Business Name` field
-[stagehand][act] type `${query.ownerFirstName}` into the input labeled `First Name`
+[page][do] await page.type('input[formcontrolname="LastBusinessName"]', "${query.ownerLastName}")
+[page][do] await page.type('input[formcontrolname="FirstName"]', "${query.ownerFirstName}")
 [endif]
-[stagehand][act] type `${query.book}` into the input labeled `Book` field
-[stagehand][act] type `${query.page}` into the input labeled `Page` field
-[stagehand][act] click Search
-[page][waitfor] 2000
-[stagehand][act] click `EXPAND ALL` button
-[stagehand][act] click the document number link next to the document icon in the first result row
-[page][waitfor] 1000
-[stagehand][observe] document has loaded
-[stagehand][act] click the print icon
-[page][waitfor] 1000
-[stagehand][act] click OK button in the modal popup
-[stagehand][handoff] enter credit card
+[page][waitfor] 3000
+[page][do] await page.type('input[formcontrolname="Book"]', "${query.book}")
+[page][do] await page.type('input[formcontrolname="Page"]', "${query.page}")
+[page][waitfor] 3000
+[page][do] await page.click('button[form="searchForm"]')
+[page][waitfor] 3000
+[page][waitforselector] button.yellow
+[page][evaluate] (function(){ var btn = Array.from(document.querySelectorAll('button.yellow')).find(function(b){ return b.textContent.trim().includes('Expand All'); }); if(!btn) throw new Error('Expand All button not found'); btn.click(); return true; })()

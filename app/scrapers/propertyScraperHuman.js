@@ -61,13 +61,15 @@ class PropertyScraperHuman {
      * @param {string}       options.query.cookieDomain — domain for cookie injection (optional)
      * @param {object}       options.query.confirmOverrides — map of confirm questions → bool
      */
-    constructor({ query, onHandoff, onComplete, onError, onTakeoverSignal, onSessionReady, logger }) {
+    constructor({ query, onHandoff, onComplete, onError, onTakeoverSignal, onSessionReady, logger, jobId, onStatusUpdate }) {
         this.query             = query;
+        this._jobId            = jobId || null;
         this.onHandoff         = onHandoff        || (async () => {});
         this.onComplete        = onComplete       || (async () => {});
         this.onError           = onError          || (async () => {});
         this.onSessionReady    = onSessionReady   || (async () => {}); // fired once Steel session is live — sets liveViewUrl on the job
         this.onTakeoverSignal  = onTakeoverSignal || null;
+        this.onStatusUpdate    = onStatusUpdate   || null;
         this.logger            = logger           || null;
 
         const ANTHROPIC_API_KEY = process.env.SAM_SCRAPER_ANTHROPIC_API_KEY;
@@ -85,9 +87,9 @@ class PropertyScraperHuman {
         //   'steel'       (default) — Steel.dev cloud browser
         //   'browserbase'           — Browserbase cloud browser
         //   'novnc'                 — Real Chrome on DO droplet via CDP
-        //                            Requires setup-novnc.sh to be run first.
-        //                            Human sees Chrome via noVNC web viewer.
-        //                            Best for Cloudflare-protected sites.
+        //   'extension'             — User's real Chrome via Chrome Extension CDP bridge
+        //                            Human installs extension, bot controls their browser
+        //                            Bypasses Cloudflare — real Chrome, real IP, real fingerprint
         this.provider = (
             _.get(this.query, 'cloudBrowser') ||
             process.env.CLOUD_BROWSER ||
@@ -128,12 +130,9 @@ class PropertyScraperHuman {
             }
         }
 
-        if (this.provider === 'novnc') {
-            // noVNC web viewer — human opens this in their browser
-            // Human sees and interacts with real Chrome running on the DO droplet
-            const host = process.env.NOVNC_PUBLIC_HOST || 'localhost';
-            const port = process.env.NOVNC_PORT || '6080';
-            return `http://${host}:${port}/vnc.html?autoconnect=true&password=${process.env.NOVNC_PASSWORD || 'changeme'}`;
+        if (this.provider === 'extension') {
+            // User sees their own real Chrome — no separate live view URL needed
+            return null;
         }
 
         // Steel — debugUrl with interactive=true is publicly embeddable
@@ -245,24 +244,39 @@ class PropertyScraperHuman {
             await this.stagehand.init();
             console.log(`[human] Browserbase session: ${this.stagehand.browserbaseSessionID}`);
 
-        } else if (this.provider === 'novnc') {
-            // ── noVNC — real Chrome on DO droplet via CDP ─────────────────────
-            // Chrome must be running with --remote-debugging-port=9222
-            // Run scripts/setup-novnc.sh on the droplet first.
-            const cdpUrl = process.env.NOVNC_CDP_URL || 'http://localhost:9222';
-            console.log(`[human] connecting to Chrome via CDP: ${cdpUrl}`);
+        } else if (this.provider === 'extension') {
+            // ── Chrome Extension CDP Bridge ───────────────────────────────────
+            // User's real Chrome controlled via SAM Scraper Chrome Extension.
+            // Uses high-level action commands — no Stagehand/CDP issues.
+            const cdpBridge = require('../functions/cdpBridge');
 
-            this.stagehand = new Stagehand({
-                env:           'LOCAL',
-                verbose:       1,
-                enableCaching: true,
-                model:         this._stagehandModel,
-                localBrowserLaunchOptions: {
-                    cdpUrl,
-                },
+            console.log(`[human] waiting for Chrome extension | job: ${this._jobId}`);
+            this.logger?.info('Open the SAM Scraper Bridge extension → select this job → click Connect');
+
+            // Set job status to waiting so extension popup shows it
+            if (this.onStatusUpdate) {
+                await this.onStatusUpdate('waiting');
+            }
+
+            // Wait for extension WebSocket to connect
+            await cdpBridge.waitForExtension(this._jobId, 5 * 60 * 1000);
+            console.log('[human] Chrome extension connected');
+            this.logger?.info('Extension connected — bot is now controlling your browser');
+
+            // Run MD file via ExtensionScraper (no Stagehand needed)
+            const ExtensionScraper = require('./extensionScraper');
+            const extScraper = new ExtensionScraper({
+                query:          this.query,
+                jobId:          this._jobId,
+                onHandoff:      this.onHandoff,
+                onComplete:     this.onComplete,
+                onError:        this.onError,
+                onStatusUpdate: this.onStatusUpdate,
+                logger:         this.logger,
             });
-            await this.stagehand.init();
-            console.log('[human] connected to local Chrome via CDP');
+            await extScraper.run();
+            await this.closeProcess();
+            return; // ExtensionScraper handles its own completion
 
         } else {
             // ── Steel (default) ───────────────────────────────────────────────
@@ -381,9 +395,11 @@ class PropertyScraperHuman {
                     console.error('[human] failed to stop Browserbase session:', err.message);
                 }
             }
-        } else if (this.provider === 'novnc') {
-            // noVNC — Chrome keeps running on the droplet, nothing to release
-            console.log('[human] noVNC session closed (Chrome stays running on droplet)');
+        } else if (this.provider === 'extension') {
+            // Extension — close the bridge, extension detaches from the tab
+            const cdpBridge = require('../functions/cdpBridge');
+            cdpBridge.closeJob(this._jobId);
+            console.log('[human] extension bridge closed');
         } else {
             // Steel
             if (this.steelSession?.id) {

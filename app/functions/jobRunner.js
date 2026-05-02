@@ -65,6 +65,11 @@ async function runScraper(job, query) {
             console.log(`[job:${job.id}] session ready | liveViewUrl: ${liveViewUrl}`);
         },
 
+        onStatusUpdate: async (status) => {
+            await updateJob(job.id, { status });
+            console.log(`[job:${job.id}] status → ${status}`);
+        },
+
         /**
          * onHandoff — type2 only
          * Suspends until signalJob('resume') or signalJob('cancel') is called.
@@ -140,11 +145,19 @@ async function runScraper(job, query) {
     };
 
     // ── run ───────────────────────────────────────────────────────────────────
-    const instance = new ScraperClass({ query, standalone: false, logger, ...callbacks });
+    const instance = new ScraperClass({ query, standalone: false, logger, jobId: job.id, ...callbacks });
     try {
         await instance.startNow();
     } finally {
         await updateJob(job.id, { liveViewUrl: null });
+
+        // Broadcast final status to any still-connected WebSocket clients
+        const finalJob = await require('../store/jobStore').getJob(job.id);
+        if (finalJob && !['completed', 'failed', 'cancelled'].includes(finalJob.status)) {
+            // Scraper exited without setting a terminal status — mark as failed
+            await updateJob(job.id, { status: 'failed', error: 'Scraper exited unexpectedly' });
+            logger.error('Scraper exited unexpectedly');
+        }
 
         if (job.scraper === 'human') {
             const provider = instance.provider || 'steel';

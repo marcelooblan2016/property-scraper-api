@@ -2,3 +2,21 @@ NC, DAVIDSON
 LANNING JORDAN
 Book & Page 2712-2405
 node index.js --propertyId=19009 --ownerLastName="LANNING" --ownerFirstName="JORDAN" --county="DAVIDSON" --state="NC" --book="2712" --page="2405"
+
+
+curl -X POST http://localhost:4000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer supersecret" \
+  -d '{
+    "scraper": "bot",
+    "query": {
+      "propertyId": "19009",
+      "ownerLastName": "LANNING",
+      "ownerFirstName": "JORDAN",
+      "county": "DAVIDSON",
+      "state": "NC",
+      "book": "2712",
+      "page": "2405"
+    },
+    "webhookUrl": null
+  }'

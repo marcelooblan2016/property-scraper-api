@@ -63,7 +63,7 @@ class JobLogger {
             const timestamp = new Date().toISOString();
             const date      = timestamp.slice(0, 10);
             const dir       = path.resolve(`./logs/${this.propertyId}`);
-            const logFile   = path.join(dir, `property-internal.log`);
+            const logFile   = path.join(dir, `${date}-internal.log`);
 
             fs.mkdirSync(dir, { recursive: true });
 

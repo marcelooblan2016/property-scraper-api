@@ -20,6 +20,7 @@ const path            = require('path');
 const { createJob, getJob, updateJob, listJobs, serializeJob, signalJob } = require('../store/jobStore');
 const { runScraper }  = require('../functions/jobRunner');
 const { fireWebhook } = require('../functions/webhook');
+const logServer       = require('../functions/logServer');
 
 const router = Router();
 
@@ -50,12 +51,30 @@ router.post('/', async (req, res) => {
         console.error(`[job:${job.id}] unhandled runner error:`, err.message);
         await updateJob(job.id, { status: 'failed', error: err.message });
         await fireWebhook(job, { status: 'failed', error: err.message });
+        // Broadcast failure to WebSocket clients
+        logServer.broadcast(job.id, {
+            jobId:     job.id,
+            type:      'error',
+            message:   `Job failed | ${err.message}`,
+            timestamp: new Date().toISOString(),
+        });
     });
 
     return res.status(202).json({ jobId: job.id, status: 'queued' });
 });
 
-// ── GET /jobs ─────────────────────────────────────────────────────────────────
+// ── DELETE /jobs ──────────────────────────────────────────────────────────────
+// Clear all jobs from Redis (dev/debug only)
+router.delete('/', async (req, res) => {
+    const jobs     = await listJobs();
+    const pipeline = require('../store/jobStore').redis.pipeline();
+    jobs.forEach(j => {
+        pipeline.del(`job:${j.id}`);
+    });
+    pipeline.del('jobs:index');
+    await pipeline.exec();
+    return res.json({ ok: true, cleared: jobs.length });
+});
 router.get('/', async (req, res) => {
     const jobs = await listJobs();
     return res.json(jobs.map(serializeJob));
@@ -136,7 +155,21 @@ router.post('/:id/cancel', async (req, res) => {
     return res.json({ ok: true });
 });
 
-// ── GET /jobs/:id/logs ────────────────────────────────────────────────────────
+// ── POST /jobs/:id/bridge-ready ───────────────────────────────────────────────
+// Called by the Chrome extension when it has attached the debugger to a tab.
+// The extension passes the tabId — Node signals cdpBridge to resolve.
+router.post('/:id/bridge-ready', async (req, res) => {
+    const job = await getJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    const { tabId, bridgePort } = req.body;
+    console.log(`[bridge-ready] job: ${req.params.id} | tabId: ${tabId}`);
+
+    const cdpBridge = require('../functions/cdpBridge');
+    cdpBridge.signalReady(req.params.id, { tabId, bridgePort });
+
+    return res.json({ ok: true });
+});
 // Returns the log file contents for a job (today's log by default)
 router.get('/:id/logs', async (req, res) => {
     const job = await getJob(req.params.id);
