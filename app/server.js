@@ -28,8 +28,8 @@ const PORT       = process.env.NODE_PORT || 4000;
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 app.use(cors({
-    origin: process.env.CORS_ORIGIN || '*',
-    methods: ['GET', 'POST', 'OPTIONS'],
+    origin:  process.env.CORS_ORIGIN || '*',
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 

@@ -2,7 +2,6 @@
 [page][waitfor] 3000
 [if query.isBusinessName==='true']
 [page][do] await page.type('input[formcontrolname="LastBusinessName"]', "${query.ownerLastName}")
-
 [else]
 [page][do] await page.type('input[formcontrolname="LastBusinessName"]', "${query.ownerLastName}")
 [page][do] await page.type('input[formcontrolname="FirstName"]', "${query.ownerFirstName}")
@@ -15,3 +14,6 @@
 [page][waitfor] 3000
 [page][waitforselector] button.yellow
 [page][evaluate] (function(){ var btn = Array.from(document.querySelectorAll('button.yellow')).find(function(b){ return b.textContent.trim().includes('Expand All'); }); if(!btn) throw new Error('Expand All button not found'); btn.click(); return true; })()
+[page][waitfor] 1000
+[page][clickselector] .resultRow:first-child .resultRowDetail button
+[stagehand][handoff] Please review the document and print to purchase it

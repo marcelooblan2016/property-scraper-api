@@ -1,8 +1,9 @@
-https://titlesearch.afxllc.com/projects/375348
-FL, DIXIE
-SANDERS, DAVID L
-Book & Page: 390-67
-node index.js --propertyId=375348 --ownerLastName="SANDERS" --ownerFirstName="DAVID" --county="DIXIE" --state="FL" --book="390" --page="67"
+https://titlesearch.afxllc.com/projects/444425
+HARDEE, FL
+ROJAS MARIA / ROJAS SANDRA
+Book & Page: 434-42
+
+
 
 curl -X POST http://localhost:4000/jobs \
   -H "Content-Type: application/json" \
@@ -10,12 +11,12 @@ curl -X POST http://localhost:4000/jobs \
   -d '{
     "scraper": "human",
     "query": {
-      "propertyId": "375348",
-      "ownerLastName": "SANDERS",
-      "ownerFirstName": "DAVID",
-      "book": "390",
-      "page": "67",
-      "county": "DIXIE",
+      "propertyId": "444425",
+      "ownerLastName": "ROJAS",
+      "ownerFirstName": "MARIA",
+      "book": "434",
+      "page": "42",
+      "county": "HARDEE",
       "state": "FL",
       "cloudBrowser": "extension"
     },

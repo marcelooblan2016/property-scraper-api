@@ -1,8 +1,8 @@
-https://titlesearch.afxllc.com/projects/375348
-FL, DIXIE
-SANDERS, DAVID L
-Book & Page: 390-67
-node index.js --propertyId=375348 --ownerLastName="SANDERS" --ownerFirstName="DAVID" --county="DIXIE" --state="FL" --book="390" --page="67"
+https://titlesearch.afxllc.com/projects/388106
+FL, MADISON
+FULL CIRCLE DAIRY LLC
+Book & Page: 1176-26
+
 
 curl -X POST http://localhost:4000/jobs \
   -H "Content-Type: application/json" \
@@ -10,12 +10,12 @@ curl -X POST http://localhost:4000/jobs \
   -d '{
     "scraper": "human",
     "query": {
-      "propertyId": "375348",
-      "ownerLastName": "SANDERS",
-      "ownerFirstName": "DAVID",
-      "book": "390",
-      "page": "67",
-      "county": "DIXIE",
+      "propertyId": "388106",
+      "ownerLastName": "FULL CIRCLE DAIRY LLC",
+      "ownerFirstName": "",
+      "book": "1176",
+      "page": "26",
+      "county": "LIBERTY",
       "state": "FL",
       "cloudBrowser": "extension"
     },

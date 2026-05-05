@@ -13,18 +13,15 @@
  *   [page][clickselector] <selector>
  *   [page][evaluate] <js expression>
  *   [page][waitforurl] <fragment>
- *   [page][do] await page.type('#selector', 'text')
- *   [page][do] await page.click('selector')
- *   [page][do] await page.waitForSelector('.result-list')
  *   [stagehand][handoff] <message>   ← pauses for human, shows in extension popup
  *   [stagehand][act] <instruction>   ← evaluates as JS via extension
  *
  * All other verbs are logged and skipped with a warning.
  */
 
-const fs        = require('fs');
-const path      = require('path');
-const _         = require('lodash');
+const fs       = require('fs');
+const path     = require('path');
+const _        = require('lodash');
 const cdpBridge = require('../functions/cdpBridge');
 const helper         = require("../../helpers/generalHelper.js");
 const { uploadToS3 } = require('../../helpers/s3Uploader.js');
@@ -143,13 +140,10 @@ class ExtensionScraper {
                 this.logger?.internal(line, 'error', err.message);
                 this.logger?.error(`Action failed: ${err.message}`);
 
-                // ── Auto-handoff to human on any action failure ────────────
+                // Stop MD execution and hand off to human
                 this.logger?.handoff(`Action failed — human takeover needed: ${err.message}`);
-                await this.cmd('focusTab', {}).catch(() => {}); // bring tab to front
-                await this.onHandoff({
-                    message: `Action failed on: [${t}][${v}] ${payload} — ${err.message}. Please complete manually then click Resume.`
-                });
-                // Continue from next action after human resumes
+                await this.onHandoff({ message: `Action failed on: [${t}][${v}] ${payload} — ${err.message}. Please complete manually then click Resume.` });
+                // Continue from next action after resume
             }
         }
 
@@ -184,8 +178,33 @@ class ExtensionScraper {
                 await this.cmd('click', { selector: payload });
                 return;
             }
+            if (verb === 'downloadnewtab') {
+                // Extension intercepts new tab, downloads PDF, returns base64
+                const result = await this.cmd('downloadnewtab', { savePath: payload }, 30000);
+                if (!result?.base64) throw new Error('No PDF data received');
+
+                // Save base64 to file
+                const dir = path.dirname(path.resolve(payload));
+                fs.mkdirSync(dir, { recursive: true });
+                const buffer = Buffer.from(result.base64, 'base64');
+                fs.writeFileSync(path.resolve(payload), buffer);
+                this.logger?.info(`PDF downloaded: ${payload} (${buffer.length} bytes)`);
+                return;
+            }
             if (verb === 'evaluate' || verb === 'execute') {
                 await this.cmd('evaluate', { expression: payload });
+                return;
+            }
+            if (verb === 'do') {
+                // [page][do] uses Playwright syntax — convert to JS equivalent
+                // page.type(selector, text) → find el, set value, dispatch events
+                // page.click(selector) → el.click()
+                const converted = payload
+                    .replace(/await page\.type\((['"`])(.+?)\1,\s*(['"`])(.+?)\3\)/g,
+                        "(function(){ var el = document.querySelector('$2'); if(!el) return false; el.click(); el.focus(); el.value=''; el.value='$4'; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return true; })()")
+                    .replace(/await page\.click\((['"`])(.+?)\1\)/g,
+                        "(function(){ var el = document.querySelector('$2'); if(!el) return false; el.click(); return true; })()");
+                await this.cmd('evaluate', { expression: converted });
                 return;
             }
             if (verb === 'waitforurl') {
@@ -210,12 +229,6 @@ class ExtensionScraper {
                 await this.cmd('evaluate', {
                     expression: `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(payload)}, bubbles: true }))`,
                 });
-                return;
-            }
-
-            // ── [page][do] — Puppeteer-style explicit selector commands ────
-            if (verb === 'do') {
-                await this._executeDo(payload);
                 return;
             }
         }
@@ -254,115 +267,6 @@ class ExtensionScraper {
         // Unknown verb — log and skip
         console.warn(`[ext] unknown verb: [${target}][${verb}] — skipping`);
         this.logger?.info(`Skipped unknown verb: [${target}][${verb}]`);
-    }
-
-    // ── [page][do] parser & executor ─────────────────────────────────────────
-    //
-    //  Supported:
-    //    await page.type('#selector', 'text')
-    //    await page.click('selector')
-    //    await page.waitForSelector('selector')
-    //    await page.waitForTimeout(ms)
-    //    await page.goto('url')
-    //    await page.select('selector', 'value')   ← dropdown
-    //    await page.focus('selector')
-    //    await page.keyboard.press('Enter')
-    //
-    async _executeDo(raw) {
-        // Strip leading "await " if present
-        const cmd = raw.trim().replace(/^await\s+/, '');
-
-        console.log(`[ext][do] ${cmd}`);
-        this.logger?.info(`Do: ${cmd}`);
-
-        // ── page.type('#selector', 'text') ───────────────────────────────
-        const typeMatch = cmd.match(/^page\.type\(\s*(["'`])(.*?)\1\s*,\s*(["'`])(.*?)\3\s*\)/s);
-        if (typeMatch) {
-            await this.cmd('typeHuman', { selector: typeMatch[2], text: typeMatch[4] });
-            return;
-        }
-
-        // ── page.click('selector') ───────────────────────────────────────
-        const clickMatch = cmd.match(/^page\.click\(\s*(["'`])(.*?)\1\s*\)/s);
-        if (clickMatch) {
-            await this.cmd('click', { selector: clickMatch[2] });
-            return;
-        }
-
-        // ── page.waitForSelector('selector') ────────────────────────────
-        const waitSelMatch = cmd.match(/^page\.waitForSelector\(\s*(["'`])(.*?)\1\s*\)/s);
-        if (waitSelMatch) {
-            const selector = waitSelMatch[2];
-            await this.cmd('evaluate', {
-                expression: `new Promise((resolve, reject) => {
-                    const start = Date.now();
-                    const check = () => {
-                        if (document.querySelector(${JSON.stringify(selector)})) resolve(true);
-                        else if (Date.now() - start > 15000) reject(new Error('waitForSelector timeout: ${selector}'));
-                        else setTimeout(check, 300);
-                    };
-                    check();
-                })`,
-            }, 20000);
-            return;
-        }
-
-        // ── page.waitForTimeout(ms) ──────────────────────────────────────
-        const waitTimeMatch = cmd.match(/^page\.waitForTimeout\(\s*(\d+)\s*\)/);
-        if (waitTimeMatch) {
-            await new Promise(r => setTimeout(r, parseInt(waitTimeMatch[1])));
-            return;
-        }
-
-        // ── page.goto('url') ─────────────────────────────────────────────
-        const gotoMatch = cmd.match(/^page\.goto\(\s*(["'`])(.*?)\1\s*\)/s);
-        if (gotoMatch) {
-            await this.cmd('goto', { url: gotoMatch[2] }, 60000);
-            return;
-        }
-
-        // ── page.select('selector', 'value') — dropdown ──────────────────
-        const selectMatch = cmd.match(/^page\.select\(\s*(["'`])(.*?)\1\s*,\s*(["'`])(.*?)\3\s*\)/s);
-        if (selectMatch) {
-            const selector = selectMatch[2];
-            const value    = selectMatch[4];
-            await this.cmd('evaluate', {
-                expression: `(() => {
-                    const el = document.querySelector(${JSON.stringify(selector)});
-                    if (!el) throw new Error('Element not found: ${selector}');
-                    el.value = ${JSON.stringify(value)};
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    return true;
-                })()`,
-            });
-            return;
-        }
-
-        // ── page.focus('selector') ───────────────────────────────────────
-        const focusMatch = cmd.match(/^page\.focus\(\s*(["'`])(.*?)\1\s*\)/s);
-        if (focusMatch) {
-            await this.cmd('evaluate', {
-                expression: `(() => {
-                    const el = document.querySelector(${JSON.stringify(focusMatch[2])});
-                    if (!el) throw new Error('Element not found: ${focusMatch[2]}');
-                    el.focus();
-                    return true;
-                })()`,
-            });
-            return;
-        }
-
-        // ── page.keyboard.press('Key') ───────────────────────────────────
-        const keyMatch = cmd.match(/^page\.keyboard\.press\(\s*(["'`])(.*?)\1\s*\)/s);
-        if (keyMatch) {
-            await this.cmd('evaluate', {
-                expression: `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(keyMatch[2])}, bubbles: true }))`,
-            });
-            return;
-        }
-
-        // ── Unrecognised — throw so run()'s catch triggers auto-handoff ──
-        throw new Error(`Unrecognised [page][do] command: ${cmd}`);
     }
 
     // ── AI act — sends page HTML to Claude, executes resulting JS in extension ──
@@ -422,8 +326,6 @@ ${html.slice(0, 5000)}`,
             const result = await this.cmd('evaluate', { expression: js });
             console.log(`[ext][act] result:`, result);
 
-            // ── If LLM-generated JS returned false → element not found, throw so
-            //    the catch in run() auto-hands off to human ─────────────────────
             if (result?.value === false) {
                 throw new Error(`Element not found or action failed: ${instruction}`);
             }
@@ -433,7 +335,7 @@ ${html.slice(0, 5000)}`,
         } catch (err) {
             console.error('[ext][act] failed:', err.message);
             this.logger?.error(`AI action failed: ${err.message}`);
-            throw err; // ← re-thrown so run()'s catch triggers the handoff
+            throw err;
         }
     }
 
@@ -447,11 +349,11 @@ ${html.slice(0, 5000)}`,
             if (verb === 'waitforurl')      return `Waiting for URL: ${payload}`;
             if (verb === 'waitforselector') return `Waiting for element: ${payload}`;
             if (verb === 'press')           return `Pressing key: ${payload}`;
-            if (verb === 'do')              return `Do: ${payload}`;
+            if (verb === 'downloadnewtab')  return `Downloading PDF → ${payload}`;
         }
         if (target === 'stagehand') {
-            if (verb === 'handoff')    return `Waiting for human: ${payload}`;
-            if (verb === 'act')        return `AI acting: ${payload}`;
+            if (verb === 'handoff')  return `Waiting for human: ${payload}`;
+            if (verb === 'act')      return `AI acting: ${payload}`;
             if (verb === 'waitforurl') return `Waiting for URL: ${payload}`;
         }
         if (target === 'human') {

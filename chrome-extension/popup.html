@@ -5,175 +5,37 @@
     <title>SAM Scraper</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-
-        body {
-            width: 320px;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            font-size: 13px;
-            color: #1a1a1a;
-            background: #fff;
-        }
-
-        .header {
-            background: #1a1a1a;
-            color: #fff;
-            padding: 12px 16px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .header-title {
-            font-weight: 600;
-            font-size: 14px;
-        }
-
-        .status-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: #555;
-            display: inline-block;
-            margin-right: 6px;
-        }
-
-        .status-dot.connected  { background: #4ade80; }
-        .status-dot.polling    { background: #facc15; }
-        .status-dot.error      { background: #f87171; }
-
-        .section {
-            padding: 14px 16px;
-            border-bottom: 1px solid #f0f0f0;
-        }
-
-        .section-title {
-            font-size: 10px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: #999;
-            margin-bottom: 10px;
-        }
-
+        body { width: 320px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; color: #1a1a1a; background: #fff; }
+        .header { background: #1a1a1a; color: #fff; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; }
+        .header-title { font-weight: 600; font-size: 14px; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; display: inline-block; margin-right: 6px; }
+        .status-dot.polling { background: #facc15; }
+        .status-dot.connected { background: #4ade80; }
+        .section { padding: 14px 16px; border-bottom: 1px solid #f0f0f0; }
+        .section-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: #999; margin-bottom: 10px; }
         .field { margin-bottom: 8px; }
-
-        .field label {
-            display: block;
-            font-size: 11px;
-            color: #666;
-            margin-bottom: 3px;
-        }
-
-        .field input {
-            width: 100%;
-            padding: 6px 8px;
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            font-size: 12px;
-            outline: none;
-        }
-
-        .field input:focus {
-            border-color: #1a1a1a;
-        }
-
-        .btn {
-            width: 100%;
-            padding: 8px;
-            border: none;
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: 500;
-            cursor: pointer;
-            margin-bottom: 6px;
-        }
-
-        .btn:last-child { margin-bottom: 0; }
+        .field label { display: block; font-size: 11px; color: #666; margin-bottom: 3px; }
+        .field input { width: 100%; padding: 6px 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 12px; outline: none; }
+        .field input:focus { border-color: #1a1a1a; }
+        .btn { width: 100%; padding: 8px; border: none; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; margin-bottom: 6px; }
         .btn:disabled { opacity: 0.4; cursor: default; }
-
-        .btn-primary   { background: #1a1a1a; color: #fff; }
-        .btn-warning   { background: #f59e0b; color: #fff; }
-        .btn-danger    { background: #ef4444; color: #fff; }
+        .btn-primary { background: #1a1a1a; color: #fff; }
+        .btn-warning { background: #f59e0b; color: #fff; }
         .btn-secondary { background: #f5f5f5; color: #333; border: 1px solid #e5e5e5; }
-
-        .job-card {
-            background: #f8f8f8;
-            border-radius: 8px;
-            padding: 10px 12px;
-            margin-bottom: 8px;
-        }
-
-        .job-card-id {
-            font-family: monospace;
-            font-size: 11px;
-            color: #666;
-            margin-bottom: 4px;
-        }
-
-        .job-card-status {
-            font-size: 12px;
-            font-weight: 500;
-        }
-
-        .status-waiting   { color: #d97706; }
-        .status-running   { color: #2563eb; }
-        .status-completed { color: #16a34a; }
-        .status-failed    { color: #dc2626; }
-
-        .tag {
-            display: inline-block;
-            font-size: 10px;
-            padding: 2px 6px;
-            border-radius: 99px;
-            font-weight: 500;
-        }
-
-        .tag-waiting   { background: #fef3c7; color: #d97706; }
-        .tag-running   { background: #dbeafe; color: #2563eb; }
+        .job-card { background: #f8f8f8; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+        .job-card-id { font-family: monospace; font-size: 10px; color: #666; margin-bottom: 4px; word-break: break-all; }
+        .tag { display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 99px; font-weight: 500; }
+        .tag-waiting { background: #fef3c7; color: #d97706; }
+        .tag-running { background: #dbeafe; color: #2563eb; }
         .tag-completed { background: #dcfce7; color: #16a34a; }
-        .tag-failed    { background: #fee2e2; color: #dc2626; }
-
-        .bridge-status {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            padding: 8px 12px;
-            background: #f0fdf4;
-            border-radius: 6px;
-            font-size: 12px;
-            color: #166534;
-            margin-bottom: 8px;
-        }
-
-        .bridge-status.disconnected {
-            background: #f5f5f5;
-            color: #666;
-        }
-
-        .empty {
-            text-align: center;
-            padding: 16px;
-            color: #999;
-            font-size: 12px;
-        }
-
-        .save-btn {
-            font-size: 11px;
-            padding: 4px 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            background: #fff;
-            cursor: pointer;
-            float: right;
-            margin-top: -2px;
-        }
-
-        .save-btn:hover { background: #f5f5f5; }
+        .tag-failed { background: #fee2e2; color: #dc2626; }
+        .empty { text-align: center; padding: 16px; color: #999; font-size: 12px; }
+        .save-btn { font-size: 11px; padding: 4px 10px; border: 1px solid #ddd; border-radius: 4px; background: #fff; cursor: pointer; float: right; margin-top: -2px; }
+        .auto-badge { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 8px 12px; font-size: 11px; color: #166534; margin-bottom: 10px; }
     </style>
 </head>
 <body>
 
-<!-- Header -->
 <div class="header">
     <span class="header-title">SAM Scraper Bridge</span>
     <span>
@@ -197,41 +59,19 @@
         <input id="apiSecret" type="text" placeholder="supersecret" />
     </div>
     <div class="field">
-        <label>Bridge Port (Node listens on this)</label>
+        <label>Bridge Port</label>
         <input id="bridgePort" type="number" placeholder="9223" value="9223" />
     </div>
 </div>
 
-<!-- Bridge status -->
-<div class="section">
-    <div class="section-title">CDP Bridge</div>
-
-    <div class="bridge-status disconnected" id="bridgeStatus">
-        <span class="status-dot" id="bridgeDot"></span>
-        <span id="bridgeStatusText">Not connected</span>
-    </div>
-
-    <div class="field">
-        <label>Job ID (to attach bridge to)</label>
-        <input id="jobIdInput" placeholder="paste job ID here" />
-    </div>
-
-    <button class="btn btn-primary" id="connectBtn">
-        Connect Bridge to Current Tab
-    </button>
-    <p style="font-size:10px;color:#999;margin-top:6px;">
-        ⚠ First navigate to the target website in this tab, then click Connect
-    </p>
-    <button class="btn btn-secondary" id="disconnectBtn" disabled>
-        Disconnect
-    </button>
-</div>
-
-<!-- Active jobs -->
+<!-- Active Jobs -->
 <div class="section">
     <div class="section-title">Active Jobs</div>
+    <div class="auto-badge">
+        ⚡ Auto-connect is ON — jobs are picked up automatically
+    </div>
     <div id="jobList">
-        <div class="empty">No waiting jobs</div>
+        <div class="empty">No active jobs</div>
     </div>
     <button class="btn btn-secondary" id="refreshBtn" style="margin-top:6px;">
         Refresh

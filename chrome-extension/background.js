@@ -1,27 +1,22 @@
 /**
  * background.js — SAM Scraper Chrome Extension (MV3)
  *
- * Architecture:
- * Node.js (DO) sends high-level action commands via WebSocket
- * Extension executes them using chrome.debugger + chrome.tabs APIs
- * Extension sends results back to Node
- *
- * Supported actions (maps to .md verbs):
- *   goto            → chrome.tabs.update(url)
- *   evaluate        → Runtime.evaluate (click, fill, etc)
- *   screenshot      → Page.captureScreenshot
- *   waitForUrl      → poll tab.url
- *   getUrl          → return current tab URL
- *   handoff         → notify user, wait for resume
- *   resume          → continue after handoff
- *   typeHuman       → type char-by-char with keyboard events (for [page][do])
+ * AUTONOMOUS MODE:
+ * - Polls API every 5s for waiting jobs
+ * - Auto-connects bridge for each waiting job (no user click needed)
+ * - Runs bot in background tab
+ * - Brings tab to front ONLY on [handoff]
+ * - User clicks Resume → tab goes back to background
+ * - Supports multiple concurrent jobs (one tab per job)
  */
 
 'use strict';
 
-let activeBridge  = null; // { tabId, jobId, ws }
-let pollInterval  = null;
-let handoffResolve = null; // waiting for user to click Resume
+// Map<jobId, { tabId, jobId, ws }> — supports multiple concurrent jobs
+const activeBridges = new Map();
+let pollInterval         = null;
+let autoConnected        = new Set();
+const manuallyDisconnected = new Set(); // jobs user explicitly disconnected // track jobs we already auto-connected
 
 // ── Config ────────────────────────────────────────────────────────────────────
 async function getConfig() {
@@ -33,17 +28,23 @@ async function getConfig() {
     };
 }
 
-// ── Connect bridge ────────────────────────────────────────────────────────────
-async function startBridge(existingTabId, jobId) {
+// ── Start bridge for a job ────────────────────────────────────────────────────
+async function startBridge(jobId) {
     const config = await getConfig();
     if (!config.apiSecret) throw new Error('API Secret not set');
+    if (activeBridges.has(jobId)) {
+        console.log(`[bridge] already connected for job: ${jobId}`);
+        return;
+    }
 
-    // Create a new tab for the bot — don't take over the user's current tab
+    console.log(`[bridge] auto-connecting for job: ${jobId}`);
+
+    // Create a new background tab for this job
     const newTab = await chrome.tabs.create({ url: 'about:blank', active: false });
     const tabId  = newTab.id;
-    console.log(`[bridge] created new tab ${tabId} for job ${jobId}`);
+    console.log(`[bridge] created tab ${tabId} for job ${jobId}`);
 
-    // Wait for tab to be ready before attaching debugger
+    // Wait for tab to be ready
     await new Promise((resolve) => {
         function listener(updatedTabId, info) {
             if (updatedTabId === tabId && info.status === 'complete') {
@@ -52,110 +53,118 @@ async function startBridge(existingTabId, jobId) {
             }
         }
         chrome.tabs.onUpdated.addListener(listener);
-        // Also resolve immediately if already complete
         chrome.tabs.get(tabId).then(t => {
             if (t.status === 'complete') {
                 chrome.tabs.onUpdated.removeListener(listener);
                 resolve();
             }
         });
-        // Fallback timeout
         setTimeout(resolve, 2000);
     });
 
-    // Attach Chrome debugger
+    // Attach debugger
     await chrome.debugger.attach({ tabId }, '1.3');
-    console.log(`[bridge] debugger attached to tab ${tabId}`);
-
-    // Enable required CDP domains
     await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {});
     await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {});
     await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
-    console.log('[bridge] CDP domains enabled');
+    console.log(`[bridge] debugger attached to tab ${tabId}`);
 
-    // Notify Node we are ready
+    // Notify Node
     await fetch(`${config.apiUrl}/jobs/${jobId}/bridge-ready`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiSecret}` },
         body:    JSON.stringify({ tabId, bridgePort: config.bridgePort }),
     });
 
-    // Connect WebSocket to Node bridge
+    // Connect WebSocket
     const wsHost = config.apiUrl.replace(/^http/, 'ws').replace(/:\d+$/, '');
     const ws     = new WebSocket(`${wsHost}:${config.bridgePort}/bridge?jobId=${jobId}&token=${config.apiSecret}&role=extension`);
 
     ws.onopen = () => {
-        console.log('[bridge] WS connected');
-        activeBridge = { tabId, jobId, ws };
-        notifyPopup('BRIDGE_STATUS', { status: 'connected', jobId });
+        console.log(`[bridge] WS connected | job: ${jobId}`);
+        activeBridges.set(jobId, { tabId, jobId, ws });
+        notifyPopup('BRIDGE_STATUS', { status: 'connected', jobId, tabId });
     };
 
     ws.onmessage = async (event) => {
         try {
-            const cmd = JSON.parse(event.data);
-            console.log(`[bridge] received command: ${cmd.action}`);
-            const result = await executeCommand(tabId, cmd);
+            const cmd    = JSON.parse(event.data);
+            const result = await executeCommand(tabId, cmd, jobId);
             ws.send(JSON.stringify({ id: cmd.id, result }));
         } catch (err) {
-            const cmd = JSON.parse(event.data).id;
-            ws.send(JSON.stringify({ id: cmd, error: err.message }));
+            const cmd = JSON.parse(event.data);
+            ws.send(JSON.stringify({ id: cmd?.id, error: err.message }));
         }
     };
 
-    ws.onclose = () => { console.log('[bridge] WS closed'); stopBridge(); };
-    ws.onerror = () => { console.error('[bridge] WS error'); stopBridge(); };
+    ws.onclose = () => {
+        console.log(`[bridge] WS closed | job: ${jobId}`);
+        stopBridge(jobId);
+    };
 
-    // Forward CDP events (navigation, network, etc)
+    ws.onerror = () => {
+        console.error(`[bridge] WS error | job: ${jobId}`);
+        stopBridge(jobId);
+    };
+
+    // Forward CDP events → Node
     chrome.debugger.onEvent.addListener((source, method, params) => {
-        if (source.tabId === tabId && activeBridge?.ws?.readyState === WebSocket.OPEN) {
-            activeBridge.ws.send(JSON.stringify({ type: 'event', method, params }));
+        const bridge = activeBridges.get(jobId);
+        if (source.tabId === tabId && bridge?.ws?.readyState === WebSocket.OPEN) {
+            bridge.ws.send(JSON.stringify({ type: 'event', method, params }));
         }
     });
 
-    chrome.tabs.onRemoved.addListener((removedTabId) => {
-        if (removedTabId === tabId) stopBridge();
-    });
-
-    // Auto-reattach if Chrome detaches debugger (e.g. on navigation)
+    // Auto-reattach on unexpected detach
     chrome.debugger.onDetach.addListener(async (source, reason) => {
         if (source.tabId !== tabId) return;
-        if (!activeBridge) return;
-        if (reason === 'target_closed') { stopBridge(); return; }
-
-        console.log(`[bridge] debugger detached (${reason}) — reattaching...`);
+        if (!activeBridges.has(jobId)) return;
+        if (reason === 'target_closed') { stopBridge(jobId); return; }
+        console.log(`[bridge] debugger detached (${reason}) — reattaching tab ${tabId}...`);
         try {
             await new Promise(r => setTimeout(r, 500));
             await chrome.debugger.attach({ tabId }, '1.3');
             await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {});
             await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {});
             await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
-            console.log('[bridge] debugger re-attached');
+            console.log(`[bridge] debugger re-attached | tab ${tabId}`);
         } catch (err) {
             console.error('[bridge] re-attach failed:', err.message);
         }
     });
+
+    // Cleanup if tab closed
+    chrome.tabs.onRemoved.addListener((removedTabId) => {
+        if (removedTabId === tabId) stopBridge(jobId);
+    });
 }
 
-// ── Execute action commands from Node ─────────────────────────────────────────
-async function executeCommand(tabId, cmd) {
+async function stopBridge(jobId, manual = false) {
+    const bridge = activeBridges.get(jobId);
+    if (!bridge) return;
+    try { await chrome.debugger.detach({ tabId: bridge.tabId }); } catch {}
+    try { bridge.ws?.close(); } catch {}
+    activeBridges.delete(jobId);
+    autoConnected.delete(jobId);
+    if (manual) manuallyDisconnected.add(jobId);
+    notifyPopup('BRIDGE_STATUS', { status: 'disconnected', jobId });
+    console.log(`[bridge] stopped | job: ${jobId} | manual: ${manual}`);
+}
+
+// ── Execute action commands ────────────────────────────────────────────────────
+async function executeCommand(tabId, cmd, jobId) {
     const { action, params } = cmd;
 
     switch (action) {
 
         case 'goto': {
-            // Detach debugger before navigation — Chrome auto-detaches on unload
             try { await chrome.debugger.detach({ tabId }); } catch {}
-
             await chrome.tabs.update(tabId, { url: params.url });
             await waitForTabLoad(tabId);
-
-            // Re-attach debugger after page loads
             await chrome.debugger.attach({ tabId }, '1.3');
             await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {});
             await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {});
             await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
-            console.log(`[bridge] re-attached debugger after goto: ${params.url}`);
-
             return { ok: true, url: params.url };
         }
 
@@ -177,57 +186,21 @@ async function executeCommand(tabId, cmd) {
 
         case 'click': {
             const res = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-                expression:    `(() => { const el = document.querySelector(${JSON.stringify(params.selector)}); if (!el) throw new Error('Element not found: ' + ${JSON.stringify(params.selector)}); el.click(); return true; })()`,
+                expression:    `(function(){ var el = document.querySelector(${JSON.stringify(params.selector)}); if(!el) throw new Error('Element not found: ' + ${JSON.stringify(params.selector)}); el.click(); return true; })()`,
                 awaitPromise:  false,
                 returnByValue: true,
                 userGesture:   true,
             });
-            if (res.exceptionDetails) throw new Error(res.exceptionDetails.text);
+            if (res.exceptionDetails) throw new Error(res.exceptionDetails?.exception?.description || res.exceptionDetails?.text);
             return { ok: true };
         }
 
-        case 'type': {
-            await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-                expression:    `document.querySelector(${JSON.stringify(params.selector)}).value = ${JSON.stringify(params.text)}`,
-                awaitPromise:  false,
-                returnByValue: true,
-            });
-            return { ok: true };
-        }
-
-        // ── typeHuman — fires keyboard events per character ────────────────
-        //    used by [page][do] await page.type(...)
-        //    mimics Puppeteer's page.type() behaviour ─────────────────────
-        case 'typeHuman': {
+        case 'getHtml': {
             const res = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-                expression: `(async () => {
-                    const el = document.querySelector(${JSON.stringify(params.selector)});
-                    if (!el) throw new Error('Element not found: ' + ${JSON.stringify(params.selector)});
-                    el.focus();
-                    el.click();
-                    el.value = '';
-                    for (const char of ${JSON.stringify(params.text)}) {
-                        el.value += char;
-                        el.dispatchEvent(new KeyboardEvent('keydown',  { key: char, bubbles: true }));
-                        el.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
-                        el.dispatchEvent(new Event('input',            { bubbles: true }));
-                        el.dispatchEvent(new KeyboardEvent('keyup',    { key: char, bubbles: true }));
-                        await new Promise(r => setTimeout(r, 30));
-                    }
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    return true;
-                })()`,
-                awaitPromise:  true,
+                expression:    'document.documentElement.outerHTML',
                 returnByValue: true,
-                userGesture:   true,
             });
-            if (res.exceptionDetails) {
-                const errMsg = res.exceptionDetails?.exception?.description
-                    || res.exceptionDetails?.text
-                    || JSON.stringify(res.exceptionDetails);
-                throw new Error(errMsg);
-            }
-            return { ok: true };
+            return { ok: true, value: res.result?.value };
         }
 
         case 'getUrl': {
@@ -240,33 +213,15 @@ async function executeCommand(tabId, cmd) {
             const timeout = params.timeout || 30000;
             while (Date.now() - start < timeout) {
                 const tab = await chrome.tabs.get(tabId);
-                if (tab.url?.includes(params.fragment)) {
-                    return { ok: true, url: tab.url };
-                }
+                if (tab.url?.includes(params.fragment)) return { ok: true, url: tab.url };
                 await new Promise(r => setTimeout(r, 500));
             }
-            throw new Error(`Timeout waiting for URL fragment: ${params.fragment}`);
+            throw new Error(`Timeout waiting for URL: ${params.fragment}`);
         }
 
         case 'screenshot': {
-            const res = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
-                format:  'png',
-                quality: 80,
-            });
+            const res = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', { format: 'png', quality: 80 });
             return { ok: true, data: res.data };
-        }
-
-        case 'handoff': {
-            // Show notification to user
-            chrome.notifications.create(`handoff-${cmd.id}`, {
-                type:    'basic',
-                iconUrl: 'icons/icon48.png',
-                title:   'SAM Scraper — Action Required',
-                message: params.message || 'Please complete the required action in Chrome',
-                buttons: [{ title: 'Resume Bot' }],
-            });
-            notifyPopup('HANDOFF', { message: params.message, jobId: activeBridge?.jobId });
-            return { ok: true, waiting: true };
         }
 
         case 'focusTab': {
@@ -277,23 +232,94 @@ async function executeCommand(tabId, cmd) {
         }
 
         case 'blurTab': {
-            // Find another tab to make active instead
             const allTabs = await chrome.tabs.query({ currentWindow: true });
             const other   = allTabs.find(t => t.id !== tabId && !t.url?.startsWith('chrome-extension://'));
             if (other) await chrome.tabs.update(other.id, { active: true });
             return { ok: true };
         }
 
-        case 'ping': {
-            return { ok: true, pong: true };
+        case 'downloadnewtab': {
+            // Find the most recently opened tab (the PDF viewer tab)
+            // We look for a tab that was opened after our bot tab
+            const allTabs = await chrome.tabs.query({});
+
+            // Sort by id descending — newest tab has highest id
+            const sortedTabs = allTabs
+                .filter(t => t.id !== tabId) // not our bot tab
+                .sort((a, b) => b.id - a.id);
+
+            let pdfTab = sortedTabs[0]; // most recently opened tab
+
+            // If no other tab yet, wait for one to appear
+            if (!pdfTab || pdfTab.status !== 'complete') {
+                pdfTab = await new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => reject(new Error('New tab timeout — PDF tab did not open')), 15000);
+
+                    // Check for existing loading tabs first
+                    chrome.tabs.query({}, (tabs) => {
+                        const candidate = tabs
+                            .filter(t => t.id !== tabId)
+                            .sort((a, b) => b.id - a.id)[0];
+                        if (candidate) {
+                            if (candidate.status === 'complete') {
+                                clearTimeout(timer);
+                                resolve(candidate);
+                                return;
+                            }
+                            // Wait for it to finish loading
+                            function onUpdated(updatedTabId, info) {
+                                if (updatedTabId === candidate.id && info.status === 'complete') {
+                                    chrome.tabs.onUpdated.removeListener(onUpdated);
+                                    clearTimeout(timer);
+                                    chrome.tabs.get(candidate.id, resolve);
+                                }
+                            }
+                            chrome.tabs.onUpdated.addListener(onUpdated);
+                        } else {
+                            // No tab yet — wait for creation
+                            function onCreated(tab) {
+                                chrome.tabs.onCreated.removeListener(onCreated);
+                                function onUpdated(updatedTabId, info) {
+                                    if (updatedTabId === tab.id && info.status === 'complete') {
+                                        chrome.tabs.onUpdated.removeListener(onUpdated);
+                                        clearTimeout(timer);
+                                        chrome.tabs.get(tab.id, resolve);
+                                    }
+                                }
+                                chrome.tabs.onUpdated.addListener(onUpdated);
+                            }
+                            chrome.tabs.onCreated.addListener(onCreated);
+                        }
+                    });
+                });
+            }
+
+            const pdfUrl = pdfTab.url;
+            console.log(`[bridge] downloading from tab: ${pdfUrl}`);
+
+            // Close the PDF tab
+            await chrome.tabs.remove(pdfTab.id).catch(() => {});
+
+            // Download using extension fetch (has session cookies)
+            const response = await fetch(pdfUrl);
+            if (!response.ok) throw new Error(`Download failed: ${response.status} ${pdfUrl}`);
+
+            const buffer = await response.arrayBuffer();
+            // Convert to base64 in chunks to avoid call stack overflow on large files
+            const bytes   = new Uint8Array(buffer);
+            const chunkSize = 8192;
+            let binary = '';
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+            }
+            const base64 = btoa(binary);
+
+            return { ok: true, base64, url: pdfUrl, savePath: params.savePath };
         }
 
-        case 'getHtml': {
-            const res = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-                expression:    'document.documentElement.outerHTML',
-                returnByValue: true,
-            });
-            return { ok: true, value: res.result?.value };
+        case 'close': {
+            await stopBridge(jobId);
+            return { ok: true };
         }
 
         default:
@@ -305,7 +331,6 @@ async function executeCommand(tabId, cmd) {
 function waitForTabLoad(tabId, timeout = 30000) {
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('Tab load timeout')), timeout);
-
         function listener(updatedTabId, info) {
             if (updatedTabId === tabId && info.status === 'complete') {
                 chrome.tabs.onUpdated.removeListener(listener);
@@ -313,10 +338,7 @@ function waitForTabLoad(tabId, timeout = 30000) {
                 resolve();
             }
         }
-
         chrome.tabs.onUpdated.addListener(listener);
-
-        // Also check if already loaded
         chrome.tabs.get(tabId).then(tab => {
             if (tab.status === 'complete') {
                 chrome.tabs.onUpdated.removeListener(listener);
@@ -327,21 +349,13 @@ function waitForTabLoad(tabId, timeout = 30000) {
     });
 }
 
-async function stopBridge() {
-    if (!activeBridge) return;
-    const { tabId, jobId } = activeBridge;
-    try { await chrome.debugger.detach({ tabId }); } catch {}
-    try { activeBridge.ws?.close(); } catch {}
-    activeBridge = null;
-    notifyPopup('BRIDGE_STATUS', { status: 'disconnected', jobId });
-}
-
-// ── Job polling ───────────────────────────────────────────────────────────────
+// ── Job polling — auto-connect waiting jobs ───────────────────────────────────
 async function startPolling() {
     if (pollInterval) clearInterval(pollInterval);
     const config = await getConfig();
     if (!config.apiSecret) { console.log('[poller] no secret — skipping'); return; }
     console.log(`[poller] started | ${config.apiUrl}`);
+
     pollInterval = setInterval(async () => {
         try {
             const cfg  = await getConfig();
@@ -350,13 +364,22 @@ async function startPolling() {
             });
             if (!res.ok) return;
             const jobs = await res.json();
-            const waiting = Array.isArray(jobs) ? jobs.filter(j => j.status === 'waiting') : [];
-            for (const job of waiting) {
-                chrome.notifications.create(`job-${job.id}`, {
-                    type:    'basic',
-                    iconUrl: 'icons/icon48.png',
-                    title:   'SAM Scraper — Action Required',
-                    message: `Job ${job.id.slice(0, 8)}... needs your attention`,
+            if (!Array.isArray(jobs)) return;
+
+            const waitingJobs = jobs.filter(j => j.status === 'waiting');
+
+            for (const job of waitingJobs) {
+                if (autoConnected.has(job.id)) continue;
+                if (activeBridges.has(job.id)) continue;
+                if (manuallyDisconnected.has(job.id)) continue; // skip manually disconnected
+
+                console.log(`[poller] auto-connecting job: ${job.id}`);
+                autoConnected.add(job.id);
+                notifyPopup('AUTO_CONNECTING', { jobId: job.id });
+
+                startBridge(job.id).catch(err => {
+                    console.error(`[poller] auto-connect failed for job ${job.id}:`, err.message);
+                    autoConnected.delete(job.id);
                 });
             }
         } catch (err) { console.log('[poller] error:', err.message); }
@@ -385,24 +408,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         try {
             if (msg.type === 'GET_STATE') {
                 sendResponse({
-                    bridge:  activeBridge ? { jobId: activeBridge.jobId, tabId: activeBridge.tabId } : null,
+                    bridges: Array.from(activeBridges.values()).map(b => ({ jobId: b.jobId, tabId: b.tabId })),
                     polling: pollInterval !== null,
                 });
+
             } else if (msg.type === 'START_BRIDGE') {
-                const allTabs = await chrome.tabs.query({ active: true });
-                const tab = allTabs.find(t => t.id && !t.url?.startsWith('chrome-extension://'));
-                if (!tab) { sendResponse({ ok: false, error: 'No suitable tab found — open a browser tab first' }); return; }
-                await startBridge(tab.id, msg.jobId);
+                await startBridge(msg.jobId);
                 sendResponse({ ok: true });
+
             } else if (msg.type === 'STOP_BRIDGE') {
-                await stopBridge();
+                await stopBridge(msg.jobId, true); // manual disconnect
                 sendResponse({ ok: true });
+
             } else if (msg.type === 'RESUME_JOB') {
                 await resumeJob(msg.jobId);
                 sendResponse({ ok: true });
+
             } else if (msg.type === 'START_POLLING') {
                 await startPolling();
                 sendResponse({ ok: true });
+
             } else if (msg.type === 'STOP_POLLING') {
                 stopPolling();
                 sendResponse({ ok: true });
