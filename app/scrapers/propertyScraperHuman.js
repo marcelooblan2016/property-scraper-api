@@ -358,6 +358,33 @@ class PropertyScraperHuman {
             return;
         }
 
+        // ── Validate config type — JSON required ──────────────────────────────
+        const fileConfig = fileMarkdown.replace('.md', '.json');
+        if (!fs.existsSync(fileConfig)) {
+            const error = `Config file missing: ${fileConfig} — create it with { "type": "bot" }`;
+            console.error(`[human] ${error}`);
+            await this.onError({ error });
+            await this.closeProcess();
+            return;
+        }
+        try {
+            const configData = JSON.parse(fs.readFileSync(fileConfig, 'utf8'));
+            const configType = configData?.type;
+            if (configType !== 'bot') {
+                const error = `Config type '${configType}' is not 'bot' — use extension provider for this county`;
+                console.error(`[human] ${error}`);
+                await this.onError({ error });
+                await this.closeProcess();
+                return;
+            }
+        } catch (e) {
+            const error = `Failed to parse ${fileConfig}: ${e.message}`;
+            console.error(`[human] ${error}`);
+            await this.onError({ error });
+            await this.closeProcess();
+            return;
+        }
+
         const contents = await fs.promises.readFile(fileMarkdown, 'utf8');
         const actions  = contents.split('\n').filter(l => l.trim());
 
@@ -720,8 +747,26 @@ class PropertyScraperHuman {
             const url = payload.match(/(https?:\/\/\S+)/)?.[1] || payload.split(/\s+/)[0];
             await this.page.goto(url, { waitUntil: 'load' });
         }
-        else if (verbKey === 'execute') {
+        else if (verbKey === 'execute' || verbKey === 'evaluate') {
             await this.page.evaluate(payload);
+        }
+        else if (verbKey === 'do') {
+            // Playwright-style: page.type(sel, val) / page.click(sel)
+            const doPayload = payload;
+            const typeMatch = doPayload.match(/await page\.type\((['"`])(.+?)\1,\s*(['"`])(.+?)\3\)/);
+            const clickMatch = doPayload.match(/await page\.click\((['"`])(.+?)\1\)/);
+            if (typeMatch) {
+                const [, , sel, , val] = typeMatch;
+                await this.page.click(sel).catch(() => {});
+                await this.page.fill(sel, val);
+            } else if (clickMatch) {
+                const [, , sel] = clickMatch;
+                await this.page.click(sel);
+            } else {
+                // Complex expression — eval directly with page in scope
+                const page = this.page;
+                await eval(`(async () => { ${doPayload} })()`);
+            }
         }
         else if (verbKey === 'press') {
             await this.page.keyboard.press(payload);

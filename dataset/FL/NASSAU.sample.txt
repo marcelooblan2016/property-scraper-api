@@ -1,0 +1,36 @@
+https://titlesearch.afxllc.com/projects/374112
+FL, NASSAU
+DEPANTE MICHAEL D / WALKER BROOKE
+Book & Page: 2704-496
+
+curl -X POST http://localhost:4000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer supersecret" \
+  -d '{
+    "scraper": "human",
+    "query": {
+      "propertyId": "374112",
+      "ownerLastName": "DEPANTE",
+      "ownerFirstName": "MICHAEL",
+      "book": "2704",
+      "page": "496",
+      "county": "NASSAU",
+      "state": "FL",
+      "cloudBrowser": "extension"
+    },
+    "webhookUrl": null
+  }'
+
+
+
+curl http://localhost:4000/jobs/01086893-e4f2-42f5-ae7e-fe52ce4a5fc0 -H "Authorization: Bearer supersecret"
+
+
+curl http://localhost:4000/jobs/61584fda-9081-47e9-acc7-477e1b4b15ed/debug -H "Authorization: Bearer supersecret"
+
+
+curl -X POST http://localhost:4000/jobs/ba0c0478-6c81-4c32-b22e-b70f92b226eb/resume \
+  -H "Authorization: Bearer supersecret"
+
+curl -X DELETE http://localhost:4000/jobs \
+      -H "Authorization: Bearer supersecret"

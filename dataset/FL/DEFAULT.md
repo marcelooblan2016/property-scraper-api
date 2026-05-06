@@ -13,7 +13,6 @@
 [page][waitfor] 2000
 [page][do] await page.click('input[value="Search"]')
 [page][waitfor] 2000
-[stagehand][handoff] Please click Search & solve the CAPTCHA, then click Resume when the search page loads.
 [page][evaluate] (function(){ var rows = document.querySelectorAll('tr'); var row = Array.from(rows).find(function(r){ return r.textContent.includes('${query.book}/${query.page}'); }); if(!row) throw new Error('Row not found'); var link = row.querySelector('a.a_btn'); if(!link) throw new Error('View Image not found'); link.click(); return true; })()
 [page][waitfor] 2000
 [page][downloadnewtab] ./downloads/${query.propertyId}/deed.pdf

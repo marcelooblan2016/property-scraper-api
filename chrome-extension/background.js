@@ -317,6 +317,13 @@ async function executeCommand(tabId, cmd, jobId) {
             return { ok: true, base64, url: pdfUrl, savePath: params.savePath };
         }
 
+        case 'closeTab': {
+            try { await chrome.debugger.detach({ tabId }); } catch {}
+            await chrome.tabs.remove(tabId).catch(() => {});
+            await stopBridge(jobId);
+            return { ok: true };
+        }
+
         case 'close': {
             await stopBridge(jobId);
             return { ok: true };

@@ -1,0 +1,22 @@
+https://titlesearch.afxllc.com/projects/283916
+NV, DOUGLAS
+TURIANO GERARD M
+APN: 1318-23-810-096
+
+curl -X POST http://localhost:4000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer supersecret" \
+  -d '{
+    "scraper": "human",
+    "query": {
+      "propertyId": "429466",
+      "ownerLastName": "TURIANO",
+      "ownerFirstName": "GERARD",
+      "apn": "1318-23-810-096",
+      "book": "",
+      "page": "",
+      "county": "DOUGLAS",
+      "state": "NV"
+    },
+    "webhookUrl": null
+  }'

@@ -47,9 +47,16 @@ class ExtensionScraper {
 
     // ── Resolve .md file ──────────────────────────────────────────────────────
     resolveMdFile(county, state) {
-        const countyFile = `./dataset/${state}/${county}.md`;
-        if (fs.existsSync(countyFile)) return countyFile;
-        return `./dataset/${state}/DEFAULT.md`;
+        let countyFile = `./dataset/${state}/${county}.md`;
+        let countyFileConfig = `./dataset/${state}/${county}.json`;
+        if (!fs.existsSync(countyFile)) {
+            countyFile = `./dataset/${state}/DEFAULT.md`;
+            countyFileConfig = `./dataset/${state}/DEFAULT.json`;
+        }
+        return {
+            mdFile: countyFile,
+            mdFileConfig: countyFileConfig
+        }
     }
 
     // ── Run ───────────────────────────────────────────────────────────────────
@@ -69,10 +76,24 @@ class ExtensionScraper {
             return regex.test(upperName);
         }) ? 'true' : 'false';
 
-        const mdFile = this.resolveMdFile(county, state);
-        this.logger?.info(`Extension scraper | markdown: ${mdFile}`);
+        const { mdFile, mdFileConfig } = this.resolveMdFile(county, state);
 
+        this.logger?.info(`Extension scraper | markdown: ${mdFile}`);
         if (!fs.existsSync(mdFile)) throw new Error(`Markdown not found: ${mdFile}`);
+
+        this.logger?.info(`Extension scraper | markdown config: ${mdFileConfig}`);
+        let configType = null;
+        if (fs.existsSync(mdFileConfig)) {
+            let mdFileConfigContent = fs.readFileSync(mdFileConfig, 'utf8');
+            let mdFileConfigContentData = JSON.parse(mdFileConfigContent);
+
+            configType = _.get(mdFileConfigContentData, 'type');
+        }
+
+        if (configType !== 'bot-human') {
+            this.logger?.info(`Invalid config type: ${configType} (expected 'bot-human')`);
+            throw new Error(`Invalid config type: ${configType} (expected 'bot-human')`);
+        }
 
         const rawLines = fs.readFileSync(mdFile, 'utf8').split('\n');
 
@@ -135,6 +156,19 @@ class ExtensionScraper {
             try {
                 await this._executeVerb(t, v, payload);
                 this.logger?.internal(line, 'ok');
+
+                // Wait for page to settle before checking for CAPTCHA
+                // Skip for pure wait actions — nothing changed
+                if (v !== 'waitfor') {
+                    await this._waitForPageReady();
+                    const captcha = await this._detectCaptcha();
+                    if (captcha) {
+                        this.logger?.handoff(`CAPTCHA detected — human takeover needed`);
+                        await this.cmd('focusTab', {}).catch(() => {});
+                        await this.onHandoff({ message: `CAPTCHA detected after [${t}][${v}]. Please solve it and click Resume to continue.` });
+                        await this.cmd('blurTab', {}).catch(() => {});
+                    }
+                }
             } catch (err) {
                 console.error(`[ext] action failed: ${line}`, err.message);
                 this.logger?.internal(line, 'error', err.message);
@@ -160,6 +194,9 @@ class ExtensionScraper {
         } else {
             await this.onComplete({ filePath: null, s3Key: null, s3Url: null });
         }
+
+        // Signal extension to close the tab
+        await this.cmd('closeTab', {}).catch(() => {});
     }
 
     // ── Execute verb ──────────────────────────────────────────────────────────
@@ -336,6 +373,66 @@ ${html.slice(0, 5000)}`,
             console.error('[ext][act] failed:', err.message);
             this.logger?.error(`AI action failed: ${err.message}`);
             throw err;
+        }
+    }
+
+    // ── Wait for page to be fully ready ──────────────────────────────────────
+    async _waitForPageReady(timeoutMs = 8000) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            try {
+                const result = await this.cmd('evaluate', {
+                    expression: `document.readyState === 'complete' && !!document.body`,
+                });
+                if (result?.value === true) {
+                    // Extra wait for JS-injected elements (CAPTCHA, SPA renders)
+                    await new Promise(r => setTimeout(r, 800));
+                    return;
+                }
+            } catch { /* page may be navigating */ }
+            await new Promise(r => setTimeout(r, 300));
+        }
+    }
+
+    // ── CAPTCHA detection ─────────────────────────────────────────────────────
+    async _detectCaptcha() {
+        try {
+            const result = await this.cmd('evaluate', {
+                expression: `(function(){
+                    var html = document.body ? document.body.innerHTML.toLowerCase() : '';
+                    var signals = [
+                        // reCAPTCHA v2
+                        document.querySelector('iframe[src*="recaptcha"]'),
+                        document.querySelector('.g-recaptcha'),
+                        document.querySelector('#g-recaptcha'),
+                        // reCAPTCHA v3 — skip (invisible, doesn't need human)
+                        // Cloudflare Turnstile
+                        document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
+                        document.querySelector('iframe[src*="turnstile"]'),
+                        document.querySelector('.cf-turnstile'),
+                        document.querySelector('[data-sitekey]'),
+                        // Cloudflare challenge page
+                        document.querySelector('#challenge-form'),
+                        document.querySelector('.cf-browser-verification'),
+                        document.querySelector('#cf-please-wait'),
+                        // Generic CAPTCHA
+                        document.querySelector('#captcha'),
+                        document.querySelector('[class*="captcha"]:not([class*="recaptcha-badge"])'),
+                        document.querySelector('[id*="captcha"]'),
+                        document.querySelector('iframe[title*="challenge"]'),
+                        // hCaptcha
+                        document.querySelector('iframe[src*="hcaptcha"]'),
+                        document.querySelector('.h-captcha'),
+                        // Text indicators (only if visible CAPTCHA elements present)
+                        (html.includes('turnstile') && html.includes('cloudflare')) ? true : null,
+                        (html.includes('captcha') && html.includes('verify you are human')) ? true : null,
+                    ];
+                    return signals.some(function(s){ return !!s; });
+                })()`,
+            });
+            return result?.value === true;
+        } catch {
+            return false;
         }
     }
 
