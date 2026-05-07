@@ -155,6 +155,20 @@ async function stopBridge(jobId, manual = false) {
 async function executeCommand(tabId, cmd, jobId) {
     const { action, params } = cmd;
 
+    // Auto-reattach debugger if it was manually detached
+    const bridge = activeBridges.get(jobId);
+    if (bridge && bridge.debuggerAttached === false && action !== 'ping' && action !== 'focusTab' && action !== 'blurTab') {
+        console.log(`[bridge] auto-reattaching debugger for command: ${action}`);
+        try {
+            await chrome.debugger.attach({ tabId }, '1.3');
+            await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {});
+            await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {});
+            bridge.debuggerAttached = true;
+        } catch (err) {
+            console.warn('[bridge] auto-reattach failed:', err.message);
+        }
+    }
+
     switch (action) {
 
         case 'goto': {
@@ -317,6 +331,52 @@ async function executeCommand(tabId, cmd, jobId) {
             return { ok: true, base64, url: pdfUrl, savePath: params.savePath };
         }
 
+        case 'catchpdf': {
+            // Intercept PDF network response before print window opens
+            const pdfTimeout = params.timeout || 15000;
+            const pdfData = await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    chrome.debugger.onEvent.removeListener(onEvent);
+                    reject(new Error('PDF catch timeout'));
+                }, pdfTimeout);
+                const requestIds = new Set();
+
+                function onEvent(source, method, eventParams) {
+                    if (source.tabId !== tabId) return;
+
+                    if (method === 'Network.responseReceived') {
+                        const mime = eventParams.response?.mimeType || '';
+                        const url  = eventParams.response?.url || '';
+                        if (mime.includes('pdf') || url.toLowerCase().includes('.pdf') || mime.includes('octet-stream')) {
+                            requestIds.add(eventParams.requestId);
+                        }
+                    }
+
+                    if (method === 'Network.loadingFinished' && requestIds.has(eventParams.requestId)) {
+                        chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', {
+                            requestId: eventParams.requestId
+                        }).then(body => {
+                            chrome.debugger.onEvent.removeListener(onEvent);
+                            clearTimeout(timer);
+                            resolve(body);
+                        }).catch(err => {
+                            console.warn('[catchpdf] getResponseBody failed:', err.message);
+                        });
+                    }
+                }
+
+                chrome.debugger.onEvent.addListener(onEvent);
+            });
+
+            if (!pdfData?.body) throw new Error('No PDF body received');
+
+            const pdfBase64 = pdfData.base64Encoded
+                ? pdfData.body
+                : btoa(pdfData.body);
+
+            return { ok: true, base64: pdfBase64 };
+        }
+
         case 'closeTab': {
             try { await chrome.debugger.detach({ tabId }); } catch {}
             await chrome.tabs.remove(tabId).catch(() => {});
@@ -427,7 +487,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 await stopBridge(msg.jobId, true); // manual disconnect
                 sendResponse({ ok: true });
 
-            } else if (msg.type === 'RESUME_JOB') {
+            } else if (msg.type === 'DETACH_DEBUGGER') {
+                // Detach debugger from all active tabs — hides the banner
+                const errors = [];
+                for (const [jobId, bridge] of activeBridges) {
+                    try {
+                        await chrome.debugger.detach({ tabId: bridge.tabId });
+                        bridge.debuggerAttached = false;
+                        console.log(`[bridge] debugger detached (manual) | tab ${bridge.tabId}`);
+                    } catch (err) {
+                        errors.push(err.message);
+                    }
+                }
+                sendResponse(errors.length ? { ok: false, error: errors.join(', ') } : { ok: true });
+
+            } else if (msg.type === 'ATTACH_DEBUGGER') {
+                // Re-attach debugger to all active tabs
+                const errors = [];
+                for (const [jobId, bridge] of activeBridges) {
+                    try {
+                        await chrome.debugger.attach({ tabId: bridge.tabId }, '1.3');
+                        await chrome.debugger.sendCommand({ tabId: bridge.tabId }, 'Page.enable', {});
+                        await chrome.debugger.sendCommand({ tabId: bridge.tabId }, 'Runtime.enable', {});
+                        await chrome.debugger.sendCommand({ tabId: bridge.tabId }, 'Network.enable', {});
+                        bridge.debuggerAttached = true;
+                        console.log(`[bridge] debugger re-attached (manual) | tab ${bridge.tabId}`);
+                    } catch (err) {
+                        errors.push(err.message);
+                    }
+                }
+                sendResponse(errors.length ? { ok: false, error: errors.join(', ') } : { ok: true });
                 await resumeJob(msg.jobId);
                 sendResponse({ ok: true });
 

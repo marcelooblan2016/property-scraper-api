@@ -1,4 +1,4 @@
-[page][goto] https://ava.fidlar.com/NHStrafford/AvaWeb/#/search
+[page][goto] https://ava.fidlar.com/IABlackHawk/AvaWeb/#/search
 [page][waitfor] 3000
 [if query.isBusinessName==='true']
 [page][do] await page.type('input[formcontrolname="LastBusinessName"]', "${query.ownerLastName}")

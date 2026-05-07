@@ -147,7 +147,48 @@ async function updatePollingIndicator() {
     }
 }
 
-// ── Toast ─────────────────────────────────────────────────────────────────────
+// ── Debugger toggle ───────────────────────────────────────────────────────────
+let debuggerAttached = true;
+
+async function updateDebuggerToggle() {
+    const state    = await new Promise(resolve => chrome.runtime.sendMessage({ type: 'GET_STATE' }, resolve));
+    const bridges  = state?.bridges || [];
+    const section  = document.getElementById('debuggerToggleSection');
+    const btn      = document.getElementById('debuggerToggleBtn');
+    const statusEl = document.getElementById('debuggerStatusText');
+
+    if (bridges.length === 0) {
+        section.style.display = 'none';
+        return;
+    }
+
+    section.style.display = 'block';
+
+    if (debuggerAttached) {
+        statusEl.textContent  = '🟢 attached — banner visible';
+        statusEl.style.color  = '#166534';
+        btn.textContent       = 'Detach (hide banner)';
+        btn.className         = 'btn btn-secondary';
+    } else {
+        statusEl.textContent  = '⚪ detached — banner hidden';
+        statusEl.style.color  = '#666';
+        btn.textContent       = 'Re-attach';
+        btn.className         = 'btn btn-primary';
+    }
+}
+
+async function toggleDebugger() {
+    const msg = debuggerAttached ? 'DETACH_DEBUGGER' : 'ATTACH_DEBUGGER';
+    chrome.runtime.sendMessage({ type: msg }, (res) => {
+        if (res?.ok) {
+            debuggerAttached = !debuggerAttached;
+            updateDebuggerToggle();
+            showToast(debuggerAttached ? 'Debugger attached' : 'Debugger detached — banner hidden');
+        } else {
+            showToast(res?.error || 'Failed', 'error');
+        }
+    });
+}
 function showToast(message, type = 'success') {
     const toast = document.createElement('div');
     toast.textContent = message;
@@ -173,9 +214,16 @@ chrome.runtime.onMessage.addListener((msg) => {
 document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('saveBtn').addEventListener('click', saveSettings);
     document.getElementById('refreshBtn').addEventListener('click', refreshJobs);
+    document.getElementById('debuggerToggleBtn').addEventListener('click', toggleDebugger);
+    document.getElementById('copyFlagBtn').addEventListener('click', () => {
+        navigator.clipboard.writeText('--silent-debugger-extension-api').then(() => {
+            showToast('Flag copied — relaunch Chrome with this flag to hide the banner');
+        });
+    });
 
     loadSettings();
     updatePollingIndicator();
+    updateDebuggerToggle();
     refreshJobs();
 
     // Auto-refresh every 5s while popup is open, but skip if user is typing
@@ -184,6 +232,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const isTyping = ['apiUrl', 'apiSecret', 'bridgePort'].includes(focused?.id);
         if (!isTyping) {
             updatePollingIndicator();
+            updateDebuggerToggle();
             refreshJobs();
         }
     }, 5000);

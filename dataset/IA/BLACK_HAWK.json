@@ -1,0 +1,6 @@
+{
+  "_comment": "Configuration for BLACK_HAWK.md dataset",
+  "type": "bot-human",
+  "noCaptchaDetection": true,
+  "noCaptchaDetectionReason": "BLACK_HAWK.md does have a captcha v3 which we can bypass"
+}

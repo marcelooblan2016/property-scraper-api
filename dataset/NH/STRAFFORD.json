@@ -1,4 +1,6 @@
 {
   "_comment": "Configuration for STRAFFORD.md dataset",
-  "type": "bot-human"
+  "type": "bot-human",
+  "noCaptchaDetection": true,
+  "noCaptchaDetectionReason": "STRAFFORD.md does have a captcha v3 which we can bypass"
 }

@@ -53,10 +53,7 @@ class ExtensionScraper {
             countyFile = `./dataset/${state}/DEFAULT.md`;
             countyFileConfig = `./dataset/${state}/DEFAULT.json`;
         }
-        return {
-            mdFile: countyFile,
-            mdFileConfig: countyFileConfig
-        }
+        return { mdFile: countyFile, mdFileConfig: countyFileConfig };
     }
 
     // ── Run ───────────────────────────────────────────────────────────────────
@@ -81,19 +78,26 @@ class ExtensionScraper {
         this.logger?.info(`Extension scraper | markdown: ${mdFile}`);
         if (!fs.existsSync(mdFile)) throw new Error(`Markdown not found: ${mdFile}`);
 
-        this.logger?.info(`Extension scraper | markdown config: ${mdFileConfig}`);
-        let configType = null;
-        if (fs.existsSync(mdFileConfig)) {
-            let mdFileConfigContent = fs.readFileSync(mdFileConfig, 'utf8');
-            let mdFileConfigContentData = JSON.parse(mdFileConfigContent);
-
-            configType = _.get(mdFileConfigContentData, 'type');
+        // ── Optional config validation ─────────────────────────────────────────
+        if (!fs.existsSync(mdFileConfig)) {
+            throw new Error(`Config file missing: ${mdFileConfig} — create it with { "type": "bot-human" }`);
         }
-
-        if (configType !== 'bot-human') {
-            this.logger?.info(`Invalid config type: ${configType} (expected 'bot-human')`);
-            throw new Error(`Invalid config type: ${configType} (expected 'bot-human')`);
+        let noCaptchaDetection = false;
+        try {
+            const configData = JSON.parse(fs.readFileSync(mdFileConfig, 'utf8'));
+            const configType = configData?.type;
+            if (configType !== 'bot-human') {
+                throw new Error(`Config type '${configType}' is not 'bot-human' — use bot scraper for this county`);
+            }
+            noCaptchaDetection = configData?.noCaptchaDetection === true;
+            if (noCaptchaDetection) {
+                this.logger?.info('CAPTCHA detection disabled for this county (noCaptchaDetection: true)');
+            }
+        } catch (e) {
+            if (e.message.includes('bot-human') || e.message.includes('Config')) throw e;
+            throw new Error(`Failed to parse ${mdFileConfig}: ${e.message}`);
         }
+        this._noCaptchaDetection = noCaptchaDetection;
 
         const rawLines = fs.readFileSync(mdFile, 'utf8').split('\n');
 
@@ -159,7 +163,7 @@ class ExtensionScraper {
 
                 // Wait for page to settle before checking for CAPTCHA
                 // Skip for pure wait actions — nothing changed
-                if (v !== 'waitfor') {
+                if (v !== 'waitfor' && !this._noCaptchaDetection) {
                     await this._waitForPageReady();
                     const captcha = await this._detectCaptcha();
                     if (captcha) {
@@ -215,6 +219,18 @@ class ExtensionScraper {
                 await this.cmd('click', { selector: payload });
                 return;
             }
+            if (verb === 'catchpdf') {
+                // Intercept PDF from network (e.g. print window) and save to disk
+                const result = await this.cmd('catchpdf', { timeout: 15000 }, 20000);
+                if (!result?.base64) throw new Error('No PDF data received');
+
+                const dir = path.dirname(path.resolve(payload));
+                fs.mkdirSync(dir, { recursive: true });
+                const buffer = Buffer.from(result.base64, 'base64');
+                fs.writeFileSync(path.resolve(payload), buffer);
+                this.logger?.info(`PDF saved: ${payload} (${buffer.length} bytes)`);
+                return;
+            }
             if (verb === 'downloadnewtab') {
                 // Extension intercepts new tab, downloads PDF, returns base64
                 const result = await this.cmd('downloadnewtab', { savePath: payload }, 30000);
@@ -233,14 +249,18 @@ class ExtensionScraper {
                 return;
             }
             if (verb === 'do') {
-                // [page][do] uses Playwright syntax — convert to JS equivalent
-                // page.type(selector, text) → find el, set value, dispatch events
-                // page.click(selector) → el.click()
-                const converted = payload
+                // [page][do] uses Playwright syntax — convert to vanilla JS
+                let converted = payload
                     .replace(/await page\.type\((['"`])(.+?)\1,\s*(['"`])(.+?)\3\)/g,
                         "(function(){ var el = document.querySelector('$2'); if(!el) return false; el.click(); el.focus(); el.value=''; el.value='$4'; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return true; })()")
                     .replace(/await page\.click\((['"`])(.+?)\1\)/g,
                         "(function(){ var el = document.querySelector('$2'); if(!el) return false; el.click(); return true; })()");
+
+                // If still contains await/page references, strip them for evaluate context
+                if (converted.includes('await') || converted.includes('page.')) {
+                    converted = converted.replace(/\bawait\s+/g, '').replace(/\bpage\./g, 'document.');
+                }
+
                 await this.cmd('evaluate', { expression: converted });
                 return;
             }
@@ -273,10 +293,17 @@ class ExtensionScraper {
         if (target === 'stagehand') {
             if (verb === 'handoff') {
                 // Bring tab to front so human can interact
-                await this.cmd('focusTab', {}).catch(() => {});
+                try {
+                    await this.cmd('focusTab', {});
+                    this.logger?.info('Tab brought to front for handoff');
+                } catch (err) {
+                    console.warn('[ext][handoff] focusTab failed:', err.message);
+                }
                 await this.onHandoff({ message: payload });
                 // Push tab back to background after resume
-                await this.cmd('blurTab', {}).catch(() => {});
+                try {
+                    await this.cmd('blurTab', {});
+                } catch {}
                 return;
             }
             if (verb === 'act') {
@@ -399,33 +426,21 @@ ${html.slice(0, 5000)}`,
         try {
             const result = await this.cmd('evaluate', {
                 expression: `(function(){
-                    var html = document.body ? document.body.innerHTML.toLowerCase() : '';
                     var signals = [
                         // reCAPTCHA v2
-                        document.querySelector('iframe[src*="recaptcha"]'),
+                        document.querySelector('iframe[src*="recaptcha/api2/anchor"]'),
+                        document.querySelector('iframe[title="reCAPTCHA"]'),
                         document.querySelector('.g-recaptcha'),
-                        document.querySelector('#g-recaptcha'),
-                        // reCAPTCHA v3 — skip (invisible, doesn't need human)
                         // Cloudflare Turnstile
                         document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
-                        document.querySelector('iframe[src*="turnstile"]'),
                         document.querySelector('.cf-turnstile'),
-                        document.querySelector('[data-sitekey]'),
                         // Cloudflare challenge page
                         document.querySelector('#challenge-form'),
                         document.querySelector('.cf-browser-verification'),
                         document.querySelector('#cf-please-wait'),
-                        // Generic CAPTCHA
-                        document.querySelector('#captcha'),
-                        document.querySelector('[class*="captcha"]:not([class*="recaptcha-badge"])'),
-                        document.querySelector('[id*="captcha"]'),
-                        document.querySelector('iframe[title*="challenge"]'),
                         // hCaptcha
                         document.querySelector('iframe[src*="hcaptcha"]'),
                         document.querySelector('.h-captcha'),
-                        // Text indicators (only if visible CAPTCHA elements present)
-                        (html.includes('turnstile') && html.includes('cloudflare')) ? true : null,
-                        (html.includes('captcha') && html.includes('verify you are human')) ? true : null,
                     ];
                     return signals.some(function(s){ return !!s; });
                 })()`,
@@ -447,6 +462,7 @@ ${html.slice(0, 5000)}`,
             if (verb === 'waitforselector') return `Waiting for element: ${payload}`;
             if (verb === 'press')           return `Pressing key: ${payload}`;
             if (verb === 'downloadnewtab')  return `Downloading PDF → ${payload}`;
+            if (verb === 'catchpdf')        return `Catching PDF from network → ${payload}`;
         }
         if (target === 'stagehand') {
             if (verb === 'handoff')  return `Waiting for human: ${payload}`;
