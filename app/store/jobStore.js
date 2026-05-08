@@ -66,7 +66,6 @@ function getEmitter(jobId) {
 }
 
 function serialize(job) {
-    // Redis hset doesn't store null — convert null to empty string sentinel '__null__'
     const n = (v) => (v === null || v === undefined) ? '__null__' : v;
     return {
         id:          job.id,
@@ -74,6 +73,7 @@ function serialize(job) {
         status:      job.status,
         liveViewUrl: n(job.liveViewUrl),
         propertyId:  n(job.propertyId),
+        query:       job.query ? JSON.stringify(job.query) : '__null__',
         sessionId:   n(job.sessionId),
         webhookUrl:  n(job.webhookUrl),
         result:      job.result ? JSON.stringify(job.result) : '__null__',
@@ -89,11 +89,11 @@ function serialize(job) {
 
 function deserialize(raw) {
     if (!raw) return null;
-    // Restore null from sentinel '__null__' or legacy 'null' or empty string
     const n = (v) => (!v || v === '__null__' || v === 'null') ? null : v;
     return {
         ...raw,
         result:        n(raw.result) ? JSON.parse(raw.result) : null,
+        query:         n(raw.query)  ? JSON.parse(raw.query)  : null,
         liveViewUrl:   n(raw.liveViewUrl),
         propertyId:    n(raw.propertyId),
         sessionId:     n(raw.sessionId),
@@ -185,6 +185,8 @@ function serializeJob(job) {
         id:          job.id,
         scraper:     job.scraper,
         status:      job.status,
+        propertyId:  job.propertyId,
+        query:       job.query || null,
         liveViewUrl: job.liveViewUrl,
         result:      job.result,
         error:       job.error,

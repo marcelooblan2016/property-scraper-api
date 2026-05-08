@@ -31,8 +31,10 @@ async function saveSettings() {
 }
 
 // ── Active bridges ────────────────────────────────────────────────────────────
+let activeTab = 0; // currently selected tab index (0-2)
+
 async function refreshJobs() {
-    const data      = await chrome.storage.local.get(['apiUrl', 'apiSecret']);
+    const data      = await chrome.storage.local.get(['apiUrl', 'apiSecret', 'bridgePort']);
     const apiUrl    = data.apiUrl    || 'http://localhost:4000';
     const apiSecret = data.apiSecret || '';
 
@@ -40,74 +42,133 @@ async function refreshJobs() {
     const focused = document.activeElement;
     if (focused !== document.getElementById('apiUrl'))     document.getElementById('apiUrl').value    = apiUrl;
     if (focused !== document.getElementById('apiSecret'))  document.getElementById('apiSecret').value = apiSecret;
-    if (focused !== document.getElementById('bridgePort')) document.getElementById('bridgePort').value = (await chrome.storage.local.get('bridgePort')).bridgePort || 9223;
+    if (focused !== document.getElementById('bridgePort')) document.getElementById('bridgePort').value = data.bridgePort || 9223;
 
     if (!apiSecret) {
-        document.getElementById('jobList').innerHTML = '<div class="empty">Save your API Secret above to enable auto-connect</div>';
+        renderTabs([]);
         return;
     }
-
-    document.getElementById('jobList').innerHTML = '<div class="empty">Loading...</div>';
 
     try {
         const res  = await fetch(`${apiUrl}/jobs`, { headers: { 'Authorization': `Bearer ${apiSecret}` } });
         const jobs = await res.json();
-
         const state = await new Promise(resolve => chrome.runtime.sendMessage({ type: 'GET_STATE' }, resolve));
         const activeBridgeIds = new Set((state?.bridges || []).map(b => b.jobId));
 
         const activeJobs = Array.isArray(jobs)
-            ? jobs.filter(j => ['waiting', 'running'].includes(j.status)).slice(0, 10)
+            ? jobs.filter(j => ['waiting', 'running'].includes(j.status)).slice(0, 3)
             : [];
 
-        if (!activeJobs.length) {
-            document.getElementById('jobList').innerHTML = '<div class="empty">No active jobs — submit a job to start</div>';
-            return;
-        }
+        renderTabs(activeJobs, activeBridgeIds);
+    } catch (err) {
+        renderTabs([], null, err.message);
+    }
+}
 
-        document.getElementById('jobList').innerHTML = activeJobs.map(job => {
-            const bridged = activeBridgeIds.has(job.id);
-            return `
-                <div class="job-card">
-                    <div class="job-card-id">${job.id}</div>
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px;">
-                        <div style="display:flex;align-items:center;gap:6px;">
-                            <span class="tag tag-${job.status}">${job.status}</span>
-                            ${bridged ? '<span class="tag" style="background:#dcfce7;color:#16a34a;">⚡ bridged</span>' : ''}
-                        </div>
-                        <div style="display:flex;gap:4px;">
-                            ${job.status === 'waiting' && !bridged ? `
-                                <button class="btn btn-primary" data-action="connect" data-job="${job.id}"
-                                    style="width:auto;padding:4px 10px;margin:0;font-size:11px;">Connect</button>
-                            ` : ''}
-                            ${job.status === 'waiting' && bridged ? `
-                                <button class="btn btn-warning" data-action="resume" data-job="${job.id}"
-                                    style="width:auto;padding:4px 10px;margin:0;font-size:11px;">Resume</button>
-                            ` : ''}
-                            ${bridged ? `
-                                <button class="btn btn-secondary" data-action="disconnect" data-job="${job.id}"
-                                    style="width:auto;padding:4px 10px;margin:0;font-size:11px;">Disconnect</button>
-                            ` : ''}
-                        </div>
-                    </div>
+function renderTabs(jobs, activeBridgeIds = new Set(), errorMsg = null) {
+    const container = document.getElementById('jobList');
+
+    if (errorMsg) {
+        container.innerHTML = `<div class="empty">Cannot reach API: ${errorMsg}</div>`;
+        return;
+    }
+
+    if (jobs.length === 0) {
+        container.innerHTML = `
+            <div class="tab-bar">
+                <div class="tab tab-empty active">—</div>
+                <div class="tab tab-empty">—</div>
+                <div class="tab tab-empty">—</div>
+            </div>
+            <div class="empty">No active jobs — submit a job to start</div>`;
+        return;
+    }
+
+    // Clamp activeTab
+    if (activeTab >= jobs.length) activeTab = 0;
+
+    // Build tab bar — always show 3 slots
+    const tabBar = Array.from({ length: 3 }, (_, i) => {
+        const job = jobs[i];
+        if (!job) return `<div class="tab tab-empty">—</div>`;
+        const propertyId = job.propertyId || job.query?.propertyId || '—';
+        const tabLabel   = propertyId !== '—' ? propertyId : job.id.slice(0, 8);
+        const isActive   = i === activeTab;
+        const bridged    = activeBridgeIds.has(job.id);
+        return `
+            <div class="tab ${isActive ? 'active' : ''} ${bridged ? 'bridged' : ''}"
+                 data-tab="${i}" title="Job ${job.id}">
+                <span class="tab-property">${tabLabel}</span>
+                <span class="tab-dot tag-${job.status}"></span>
+            </div>`;
+    }).join('');
+
+    // Build content for selected tab
+    const job        = jobs[activeTab];
+    const bridged    = activeBridgeIds.has(job.id);
+    const propertyId = job.propertyId || job.query?.propertyId || '—';
+    const county     = job.query?.county || '—';
+    const state      = job.query?.state  || '—';
+    const tabLabel   = propertyId !== '—' ? propertyId : job.id.slice(0, 8);
+
+    const content = `
+        <div class="job-detail">
+            <div class="job-detail-row">
+                <span class="job-detail-label">Property ID</span>
+                <span class="job-detail-value">${propertyId}</span>
+            </div>
+            <div class="job-detail-row">
+                <span class="job-detail-label">County</span>
+                <span class="job-detail-value">${county}</span>
+            </div>
+            <div class="job-detail-row">
+                <span class="job-detail-label">State</span>
+                <span class="job-detail-value">${state}</span>
+            </div>
+            <div class="job-detail-row">
+                <span class="job-detail-label">Status</span>
+                <div style="display:flex;align-items:center;gap:4px;">
+                    <span class="tag tag-${job.status}">${job.status}</span>
+                    ${bridged ? '<span class="tag" style="background:#dcfce7;color:#16a34a;">⚡ bridged</span>' : ''}
                 </div>
-            `;
-        }).join('');
+            </div>
+            <div class="job-detail-row">
+                <span class="job-detail-label">Job ID</span>
+                <span class="job-detail-value mono">${job.id.slice(0, 16)}...</span>
+            </div>
+            <div class="job-actions">
+                ${job.status === 'waiting' && !bridged ? `
+                    <button class="btn btn-primary" data-action="connect" data-job="${job.id}">Connect</button>
+                ` : ''}
+                ${job.status === 'waiting' && bridged ? `
+                    <button class="btn btn-warning" data-action="resume" data-job="${job.id}">Resume</button>
+                ` : ''}
+                ${bridged ? `
+                    <button class="btn btn-secondary" data-action="disconnect" data-job="${job.id}">Disconnect</button>
+                ` : ''}
+            </div>
+        </div>`;
 
-        // Event delegation
-        document.getElementById('jobList').addEventListener('click', (e) => {
-            const btn    = e.target.closest('button[data-action]');
-            if (!btn) return;
+    container.innerHTML = `<div class="tab-bar">${tabBar}</div>${content}`;
+
+    // Tab click
+    container.querySelectorAll('.tab[data-tab]').forEach(t => {
+        t.addEventListener('click', () => {
+            activeTab = parseInt(t.dataset.tab);
+            refreshJobs();
+        });
+    });
+
+    // Action buttons
+    container.querySelectorAll('button[data-action]').forEach(btn => {
+        btn.addEventListener('click', () => {
             const action = btn.dataset.action;
             const jobId  = btn.dataset.job;
             if (action === 'connect')    connectBridge(jobId);
             if (action === 'resume')     resumeJob(jobId);
             if (action === 'disconnect') disconnectBridge(jobId);
         });
-
-    } catch (err) {
-        document.getElementById('jobList').innerHTML = `<div class="empty">Cannot reach API: ${err.message}</div>`;
-    }
+    });
 }
 
 async function connectBridge(jobId) {

@@ -538,3 +538,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 startPolling();
+
+// ── Open side panel on icon click ────────────────────────────────────────────
+chrome.action.onClicked.addListener((tab) => {
+    chrome.sidePanel.open({ windowId: tab.windowId });
+});

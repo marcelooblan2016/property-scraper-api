@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>SAM Scraper</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            width: 100%;
+            min-height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px;
+            color: #1a1a1a;
+            background: #fff;
+        }
+        .header {
+            background: #1a1a1a;
+            color: #fff;
+            padding: 14px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        .header-title { font-weight: 700; font-size: 15px; letter-spacing: -0.3px; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; display: inline-block; margin-right: 6px; }
+        .status-dot.polling { background: #facc15; }
+        .section { padding: 14px 16px; border-bottom: 1px solid #f0f0f0; }
+        .section-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: #999; margin-bottom: 10px; }
+        .field { margin-bottom: 8px; }
+        .field label { display: block; font-size: 11px; color: #666; margin-bottom: 3px; }
+        .field input {
+            width: 100%;
+            padding: 7px 10px;
+            border: 1px solid #e5e5e5;
+            border-radius: 8px;
+            font-size: 12px;
+            outline: none;
+            background: #fafafa;
+        }
+        .field input:focus { border-color: #1a1a1a; background: #fff; }
+        .btn {
+            width: 100%;
+            padding: 8px;
+            border: none;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            margin-bottom: 6px;
+            transition: opacity 0.15s;
+        }
+        .btn:hover { opacity: 0.85; }
+        .btn:disabled { opacity: 0.4; cursor: default; }
+        .btn-primary   { background: #1a1a1a; color: #fff; }
+        .btn-warning   { background: #f59e0b; color: #fff; }
+        .btn-secondary { background: #f5f5f5; color: #333; border: 1px solid #e5e5e5; }
+        .job-card {
+            background: #f8f8f8;
+            border-radius: 10px;
+            padding: 12px;
+            margin-bottom: 8px;
+            border: 1px solid #f0f0f0;
+        }
+        .job-card-id { font-family: monospace; font-size: 10px; color: #888; margin-bottom: 6px; word-break: break-all; }
+        .tag { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 99px; font-weight: 500; }
+        .tag-waiting   { background: #fef3c7; color: #d97706; }
+        .tag-running   { background: #dbeafe; color: #2563eb; }
+        .tag-completed { background: #dcfce7; color: #16a34a; }
+        .tag-failed    { background: #fee2e2; color: #dc2626; }
+        .empty { text-align: center; padding: 20px; color: #bbb; font-size: 12px; }
+        .save-btn {
+            font-size: 11px;
+            padding: 4px 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            background: #fff;
+            cursor: pointer;
+            float: right;
+            margin-top: -2px;
+        }
+        .save-btn:hover { background: #f5f5f5; }
+        .auto-badge {
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 11px;
+            color: #166534;
+            margin-bottom: 12px;
+        }
+        .flag-box {
+            background: #fefce8;
+            border: 1px solid #fde68a;
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 11px;
+            color: #92400e;
+            margin-top: 8px;
+        }
+        .flag-box code {
+            display: block;
+            margin: 6px 0;
+            background: #fff;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            word-break: break-all;
+        }
+        .tab-bar {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 12px;
+        }
+        .tab {
+            flex: 1;
+            padding: 8px 6px;
+            border-radius: 8px;
+            background: #f5f5f5;
+            border: 1px solid #e5e5e5;
+            cursor: pointer;
+            text-align: center;
+            font-size: 11px;
+            font-weight: 500;
+            transition: all 0.15s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+        }
+        .tab:hover { background: #ececec; }
+        .tab.active { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
+        .tab.tab-empty { color: #ccc; cursor: default; }
+        .tab.tab-empty:hover { background: #f5f5f5; }
+        .tab-property { font-weight: 600; }
+        .tab-dot {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            display: inline-block;
+            flex-shrink: 0;
+        }
+        .tab.active .tab-dot { opacity: 0.8; }
+        .tab-dot.tag-waiting  { background: #f59e0b; }
+        .tab-dot.tag-running  { background: #3b82f6; }
+        .tab-dot.tag-completed { background: #22c55e; }
+        .tab-dot.tag-failed   { background: #ef4444; }
+        .job-detail { }
+        .job-detail-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #f5f5f5;
+        }
+        .job-detail-row:last-child { border-bottom: none; }
+        .job-detail-label { font-size: 11px; color: #888; }
+        .job-detail-value { font-size: 12px; font-weight: 500; }
+        .job-detail-value.mono { font-family: monospace; font-size: 11px; color: #555; }
+        .job-actions { display: flex; gap: 6px; margin-top: 12px; }
+        .job-actions .btn { margin: 0; }
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: #f8f8f8;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-bottom: 10px;
+        border: 1px solid #f0f0f0;
+        }
+        .debugger-label { font-size: 12px; font-weight: 500; }
+        .debugger-status { font-size: 10px; color: #666; margin-top: 2px; }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <span class="header-title">SAM Scraper</span>
+    <span>
+            <span class="status-dot" id="pollingDot"></span>
+            <span id="pollingStatus" style="font-size:11px;">stopped</span>
+        </span>
+</div>
+
+<!-- Settings -->
+<div class="section">
+    <div class="section-title">
+        Settings
+        <button class="save-btn" id="saveBtn">Save</button>
+    </div>
+    <div class="field">
+        <label>API URL</label>
+        <input id="apiUrl" placeholder="http://localhost:4000" />
+    </div>
+    <div class="field">
+        <label>API Secret</label>
+        <input id="apiSecret" type="text" placeholder="supersecret" />
+    </div>
+    <div class="field">
+        <label>Bridge Port</label>
+        <input id="bridgePort" type="number" placeholder="9223" value="9223" />
+    </div>
+    <div class="flag-box">
+        ⚠ Chrome shows a "debugging" banner while bot runs.<br>
+        To hide it, launch Chrome with:
+        <code>--silent-debugger-extension-api</code>
+        <button id="copyFlagBtn" style="margin-top:4px;font-size:10px;padding:3px 10px;border:1px solid #d97706;border-radius:4px;background:#fff;cursor:pointer;color:#92400e;">Copy flag</button>
+    </div>
+</div>
+
+<!-- Debugger toggle -->
+<div class="section" id="debuggerToggleSection" style="display:none;">
+    <div class="section-title">Debugger</div>
+    <div class="debugger-row">
+        <div>
+            <div class="debugger-label">CDP Debugger</div>
+            <div class="debugger-status" id="debuggerStatusText">attached</div>
+        </div>
+        <button id="debuggerToggleBtn" class="btn btn-secondary" style="width:auto;padding:5px 14px;margin:0;font-size:11px;">
+            Detach
+        </button>
+    </div>
+</div>
+
+<!-- Active Jobs -->
+<div class="section">
+    <div class="section-title">Active Jobs</div>
+    <div class="auto-badge">
+        ⚡ Auto-connect — jobs start automatically when detected
+    </div>
+    <div id="jobList">
+        <div class="empty">No active jobs</div>
+    </div>
+    <button class="btn btn-secondary" id="refreshBtn" style="margin-top:8px;">
+        Refresh
+    </button>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

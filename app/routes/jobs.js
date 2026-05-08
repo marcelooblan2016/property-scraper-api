@@ -37,9 +37,10 @@ router.post('/', async (req, res) => {
         scraper,
         status:        'queued',
         liveViewUrl:   null,
-        resumeEmitter: new EventEmitter(), // stored locally, not in Redis
+        resumeEmitter: new EventEmitter(),
         webhookUrl,
         propertyId:    query.propertyId || null,
+        query:         query,
         result:        null,
         error:         null,
         createdAt:     new Date(),
