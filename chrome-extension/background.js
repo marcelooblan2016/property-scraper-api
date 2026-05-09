@@ -14,8 +14,9 @@
 
 // Map<jobId, { tabId, jobId, ws }> — supports multiple concurrent jobs
 const activeBridges = new Map();
-let pollInterval         = null;
-let autoConnected        = new Set();
+const tabRegistry   = new Map(); // jobId → tabId (persists after bridge closes)
+let pollInterval    = null;
+let autoConnected   = new Set();
 const manuallyDisconnected = new Set(); // jobs user explicitly disconnected // track jobs we already auto-connected
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -43,6 +44,7 @@ async function startBridge(jobId) {
     const newTab = await chrome.tabs.create({ url: 'about:blank', active: false });
     const tabId  = newTab.id;
     console.log(`[bridge] created tab ${tabId} for job ${jobId}`);
+    tabRegistry.set(jobId, tabId); // persist tabId even after bridge closes
 
     // Wait for tab to be ready
     await new Promise((resolve) => {
@@ -377,6 +379,22 @@ async function executeCommand(tabId, cmd, jobId) {
             return { ok: true, base64: pdfBase64 };
         }
 
+        case 'notifyHandoff': {
+            // Show Chrome notification with "Go to Tab" action
+            // Store the handoff info so popup can show "Go to Tab" button
+            const bridge = activeBridges.get(jobId);
+            if (bridge) bridge.pendingHandoff = params.message || 'Action required';
+            notifyPopup('HANDOFF_REQUIRED', { jobId, tabId, message: params.message });
+            // Show system notification
+            chrome.notifications.create(`handoff-${jobId}`, {
+                type:    'basic',
+                iconUrl: 'icons/icon48.png',
+                title:   'SAM Scraper — Action Required',
+                message: params.message || 'Please complete the required action',
+            });
+            return { ok: true };
+        }
+
         case 'closeTab': {
             try { await chrome.debugger.detach({ tabId }); } catch {}
             await chrome.tabs.remove(tabId).catch(() => {});
@@ -484,8 +502,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 sendResponse({ ok: true });
 
             } else if (msg.type === 'STOP_BRIDGE') {
-                await stopBridge(msg.jobId, true); // manual disconnect
+                await stopBridge(msg.jobId, true);
                 sendResponse({ ok: true });
+
+            } else if (msg.type === 'FOCUS_TAB') {
+                const bridge = activeBridges.get(msg.jobId);
+                if (!bridge) { sendResponse({ ok: false, error: 'No active bridge' }); return; }
+                try {
+                    const t = await chrome.tabs.get(bridge.tabId);
+                    await chrome.tabs.update(bridge.tabId, { active: true });
+                    await chrome.windows.update(t.windowId, { focused: true });
+                    sendResponse({ ok: true });
+                } catch (err) { sendResponse({ ok: false, error: err.message }); }
 
             } else if (msg.type === 'DETACH_DEBUGGER') {
                 // Detach debugger from all active tabs — hides the banner
@@ -502,7 +530,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 sendResponse(errors.length ? { ok: false, error: errors.join(', ') } : { ok: true });
 
             } else if (msg.type === 'ATTACH_DEBUGGER') {
-                // Re-attach debugger to all active tabs
                 const errors = [];
                 for (const [jobId, bridge] of activeBridges) {
                     try {
@@ -517,7 +544,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     }
                 }
                 sendResponse(errors.length ? { ok: false, error: errors.join(', ') } : { ok: true });
+
+            } else if (msg.type === 'RESUME_JOB') {
                 await resumeJob(msg.jobId);
+                sendResponse({ ok: true });
+
+            } else if (msg.type === 'CLOSE_TAB') {
+                const bridge = activeBridges.get(msg.jobId);
+                // Try bridge tabId first, fallback to stored tabId
+                const tabId = bridge?.tabId || tabRegistry.get(msg.jobId);
+                if (tabId) {
+                    try { await chrome.debugger.detach({ tabId }); } catch {}
+                    await chrome.tabs.remove(tabId).catch(() => {});
+                    tabRegistry.delete(msg.jobId);
+                }
+                if (bridge) await stopBridge(msg.jobId);
                 sendResponse({ ok: true });
 
             } else if (msg.type === 'START_POLLING') {

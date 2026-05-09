@@ -336,8 +336,12 @@ class PropertyScraper {
             if (!m) continue;
 
             const [, target, verb, rest] = m;
-            const payload = rest.trim();
             const verbKey = verb.toLowerCase();
+
+            // ── Extract [text="..."] comment if present ───────────────────────
+            const textMatch = rest.match(/\[text="([^"]+)"\]\s*$/);
+            const comment   = textMatch ? textMatch[1] : null;
+            const payload   = textMatch ? rest.slice(0, textMatch.index).trim() : rest.trim();
 
             // Re-acquire page before each action — handles navigations, popups, new tabs
             if (target.toLowerCase() === 'page' && (!this.page || typeof this.page.isClosed === 'function' && this.page.isClosed())) {
@@ -345,8 +349,11 @@ class PropertyScraper {
                 this.page = pages[pages.length - 1];
             }
 
-            // Log the action
-            this._log('action', this._actionMessage(target, verb, payload));
+            // Log the action — use comment if available
+            const displayMsg = comment
+                ? `[${target.toLowerCase()}][${verbKey}] ${comment}`
+                : this._actionMessage(target, verb, payload);
+            this._log('action', displayMsg);
 
             try {
                 if (target.toLowerCase() === 'page') {

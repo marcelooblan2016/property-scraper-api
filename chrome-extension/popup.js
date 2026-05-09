@@ -1,51 +1,231 @@
 /**
- * popup.js — SAM Scraper Extension Popup
- * Shows active bridges, auto-connect status, and allows manual control
+ * popup.js — SAM Scraper Extension Popup / Side Panel
+ * - 3 tabs keyed by propertyId
+ * - Per-tab live log feed via WebSocket
+ * - Auto-refresh every 3s
  */
 
-// ── Load settings ─────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
+let activeTab        = 0;
+let debuggerAttached = true;
+let logSockets       = {}; // jobId → WebSocket
+let logBuffers       = {}; // jobId → string[]
+const MAX_LOG_LINES  = 150;
+
+// ── Settings ──────────────────────────────────────────────────────────────────
 async function loadSettings() {
     const data = await chrome.storage.local.get(['apiUrl', 'apiSecret', 'bridgePort']);
-    document.getElementById('apiUrl').value     = data.apiUrl     || 'http://localhost:4000';
-    document.getElementById('apiSecret').value  = data.apiSecret  || '';
-    document.getElementById('bridgePort').value = data.bridgePort || 9223;
-    console.log('[popup] settings loaded:', { apiUrl: data.apiUrl, hasSecret: !!data.apiSecret });
+    const apiUrl    = data.apiUrl     || '';
+    const apiSecret = data.apiSecret  || '';
+    const bridgePort = data.bridgePort || 9223;
+    if (document.getElementById('apiUrl'))     document.getElementById('apiUrl').value     = apiUrl;
+    if (document.getElementById('apiSecret'))  document.getElementById('apiSecret').value  = apiSecret;
+    if (document.getElementById('bridgePort')) document.getElementById('bridgePort').value = bridgePort;
+    // Show settings drawer automatically if not configured
+    if (!apiSecret) {
+        document.getElementById('settingsDrawer')?.classList.add('open');
+    }
 }
 
 async function saveSettings() {
     const apiUrl     = document.getElementById('apiUrl').value.trim();
     const apiSecret  = document.getElementById('apiSecret').value.trim();
     const bridgePort = parseInt(document.getElementById('bridgePort').value) || 9223;
-
     if (!apiUrl || !apiSecret) { showToast('API URL and Secret are required', 'error'); return; }
-
     await chrome.storage.local.set({ apiUrl, apiSecret, bridgePort });
-
+    document.getElementById('settingsDrawer')?.classList.remove('open');
     chrome.runtime.sendMessage({ type: 'STOP_POLLING' }, () => {
         chrome.runtime.sendMessage({ type: 'START_POLLING' }, () => {
-            updatePollingIndicator();
+            updateStatusPill();
             refreshJobs();
         });
     });
-    showToast('Settings saved ✓');
+    showToast('Saved ✓');
 }
 
-// ── Active bridges ────────────────────────────────────────────────────────────
-let activeTab = 0; // currently selected tab index (0-2)
+// ── Status pill ───────────────────────────────────────────────────────────────
+async function updateStatusPill() {
+    const pill      = document.getElementById('statusPill');
+    const statusTxt = document.getElementById('statusText');
+    const pollingDot = document.getElementById('pollingDot');
+    const pollingStatus = document.getElementById('pollingStatus');
+    if (!pill) return;
+
+    const state    = await new Promise(resolve => chrome.runtime.sendMessage({ type: 'GET_STATE' }, resolve));
+    const bridges  = state?.bridges || [];
+    const polling  = state?.polling;
+    const data     = await chrome.storage.local.get(['apiSecret']);
+
+    if (!data.apiSecret) {
+        setPill(pill, statusTxt, 'stopped', 'Not configured');
+    } else if (!polling) {
+        setPill(pill, statusTxt, 'stopped', 'Not connected');
+    } else if (bridges.length > 0) {
+        setPill(pill, statusTxt, 'connected', `${bridges.length} active`);
+    } else {
+        setPill(pill, statusTxt, 'polling', 'Polling...');
+    }
+
+    // Also update legacy pollingDot if present
+    if (pollingDot && pollingStatus) {
+        pollingDot.className = polling ? 'status-dot polling' : 'status-dot';
+        pollingStatus.textContent = polling ? `polling · ${bridges.length} active` : 'stopped';
+    }
+}
+
+function setPill(pill, txt, state, label) {
+    pill.className  = `status-pill ${state}`;
+    txt.textContent = label;
+}
+
+// ── Log WebSocket ─────────────────────────────────────────────────────────────
+async function connectLogSocket(jobId) {
+    if (logSockets[jobId]?.readyState === WebSocket.OPEN) return;
+
+    const data      = await chrome.storage.local.get(['apiUrl', 'apiSecret']);
+    const apiUrl    = data.apiUrl    || 'http://localhost:4000';
+    const apiSecret = data.apiSecret || '';
+    const wsUrl     = apiUrl.replace(/^http/, 'ws') + `/logs?jobId=${jobId}&token=${apiSecret}`;
+
+    const ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+        console.log(`[log] connected for job: ${jobId}`);
+        logSockets[jobId] = ws;
+    };
+
+    ws.onmessage = (event) => {
+        try {
+            const msg = JSON.parse(event.data);
+            const line = formatLogLine(msg);
+            if (!line) return;
+            if (!logBuffers[jobId]) logBuffers[jobId] = [];
+            logBuffers[jobId].push(line);
+            if (logBuffers[jobId].length > MAX_LOG_LINES) {
+                logBuffers[jobId].shift();
+            }
+            // Update UI if this job is active tab
+            renderLogIfActive(jobId);
+        } catch {}
+    };
+
+    ws.onclose = () => {
+        delete logSockets[jobId];
+    };
+
+    ws.onerror = () => {
+        delete logSockets[jobId];
+    };
+}
+
+function formatLogLine(msg) {
+    if (!msg?.type) return null;
+    const time  = new Date().toLocaleTimeString('en-US', { hour12: false });
+    const level = (msg.type || 'INFO').toUpperCase();
+    const text  = msg.message || msg.data || '';
+    if (!text) return null;
+    return { time, level, text };
+}
+
+function disconnectLogSocket(jobId) {
+    if (logSockets[jobId]) {
+        logSockets[jobId].close();
+        delete logSockets[jobId];
+    }
+}
+
+function renderLogIfActive(jobId) {
+    // Only render if the log feed is currently showing this job
+    const logEl = document.getElementById('logFeed');
+    if (!logEl) return;
+    // Check active tab's job matches
+    renderLogFeed(jobId);
+}
+
+function renderLogFeed(jobId) {
+    const logEl = document.getElementById('logFeed');
+    if (!logEl) return;
+
+    const lines = logBuffers[jobId] || [];
+
+    // Track rendered count per job to avoid full re-render on no changes
+    const prevCount = parseInt(logEl.dataset.lineCount || '0');
+    const newLines  = lines.slice(prevCount);
+
+    if (lines.length === 0) {
+        logEl.innerHTML = '<div class="log-empty">No logs yet...</div>';
+        logEl.dataset.jobId      = jobId;
+        logEl.dataset.lineCount  = '0';
+        return;
+    }
+
+    // First render or job switch — full render
+    if (logEl.dataset.jobId !== jobId || prevCount === 0) {
+        logEl.dataset.jobId     = jobId;
+        logEl.dataset.lineCount = '0';
+        logEl.innerHTML = '';
+    }
+
+    // No new lines — do nothing, preserve scroll
+    if (newLines.length === 0) return;
+
+    // Check if user is at bottom BEFORE appending
+    const isAtBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+
+    // Append only new lines
+    const fragment = document.createDocumentFragment();
+    for (const l of newLines) {
+        const cls  = levelClass(l.level);
+        const div  = document.createElement('div');
+        div.className = `log-line ${cls}`;
+        div.innerHTML = `<span class="log-time">${l.time}</span><span class="log-level">${l.level}</span><span class="log-text">${escHtml(l.text)}</span>`;
+        fragment.appendChild(div);
+    }
+    logEl.appendChild(fragment);
+    logEl.dataset.lineCount = String(lines.length);
+
+    // Only auto-scroll if already at bottom
+    if (isAtBottom) {
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+}
+
+function levelClass(level) {
+    if (level === 'ERROR')   return 'log-error';
+    if (level === 'ACTION')  return 'log-action';
+    if (level === 'HANDOFF') return 'log-handoff';
+    if (level === 'COMPLETE') return 'log-complete';
+    return 'log-info';
+}
+
+function escHtml(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+// ── Jobs / Tabs ───────────────────────────────────────────────────────────────
+let lastJobIds = [];
 
 async function refreshJobs() {
     const data      = await chrome.storage.local.get(['apiUrl', 'apiSecret', 'bridgePort']);
-    const apiUrl    = data.apiUrl    || 'http://localhost:4000';
+    const apiUrl    = data.apiUrl    || '';
     const apiSecret = data.apiSecret || '';
 
-    // Only update fields if user is NOT currently focused on them
     const focused = document.activeElement;
     if (focused !== document.getElementById('apiUrl'))     document.getElementById('apiUrl').value    = apiUrl;
     if (focused !== document.getElementById('apiSecret'))  document.getElementById('apiSecret').value = apiSecret;
     if (focused !== document.getElementById('bridgePort')) document.getElementById('bridgePort').value = data.bridgePort || 9223;
 
-    if (!apiSecret) {
-        renderTabs([]);
+    // Not configured — show setup prompt and stop
+    if (!apiUrl || !apiSecret) {
+        document.getElementById('jobList').innerHTML = `
+            <div class="no-secret">
+                <strong>Not configured</strong>
+                Click ⚙ above to enter your API URL and Secret.
+            </div>`;
+        document.getElementById('settingsDrawer')?.classList.add('open');
         return;
     }
 
@@ -56,8 +236,22 @@ async function refreshJobs() {
         const activeBridgeIds = new Set((state?.bridges || []).map(b => b.jobId));
 
         const activeJobs = Array.isArray(jobs)
-            ? jobs.filter(j => ['waiting', 'running'].includes(j.status)).slice(0, 3)
+            ? jobs.filter(j => ['waiting', 'running', 'completed', 'failed'].includes(j.status)).slice(0, 3)
             : [];
+
+        // Connect log sockets for new jobs
+        for (const job of activeJobs) {
+            if (!logSockets[job.id]) {
+                logBuffers[job.id] = logBuffers[job.id] || [];
+                connectLogSocket(job.id);
+            }
+        }
+
+        // Disconnect sockets for jobs no longer active
+        const activeIds = new Set(activeJobs.map(j => j.id));
+        for (const jobId of Object.keys(logSockets)) {
+            if (!activeIds.has(jobId)) disconnectLogSocket(jobId);
+        }
 
         renderTabs(activeJobs, activeBridgeIds);
     } catch (err) {
@@ -67,52 +261,53 @@ async function refreshJobs() {
 
 function renderTabs(jobs, activeBridgeIds = new Set(), errorMsg = null) {
     const container = document.getElementById('jobList');
-
     if (errorMsg) {
         container.innerHTML = `<div class="empty">Cannot reach API: ${errorMsg}</div>`;
         return;
     }
-
     if (jobs.length === 0) {
         container.innerHTML = `
             <div class="tab-bar">
-                <div class="tab tab-empty active">—</div>
+                <div class="tab tab-empty">—</div>
                 <div class="tab tab-empty">—</div>
                 <div class="tab tab-empty">—</div>
             </div>
-            <div class="empty">No active jobs — submit a job to start</div>`;
+            <div class="empty">No active jobs</div>`;
         return;
     }
 
-    // Clamp activeTab
     if (activeTab >= jobs.length) activeTab = 0;
 
-    // Build tab bar — always show 3 slots
     const tabBar = Array.from({ length: 3 }, (_, i) => {
         const job = jobs[i];
         if (!job) return `<div class="tab tab-empty">—</div>`;
-        const propertyId = job.propertyId || job.query?.propertyId || '—';
-        const tabLabel   = propertyId !== '—' ? propertyId : job.id.slice(0, 8);
+        const propertyId = job.propertyId || job.query?.propertyId || job.id.slice(0, 8);
         const isActive   = i === activeTab;
         const bridged    = activeBridgeIds.has(job.id);
         return `
-            <div class="tab ${isActive ? 'active' : ''} ${bridged ? 'bridged' : ''}"
-                 data-tab="${i}" title="Job ${job.id}">
-                <span class="tab-property">${tabLabel}</span>
+            <div class="tab ${isActive ? 'active' : ''}" data-tab="${i}" title="${job.id}">
+                <span class="tab-property">${propertyId}</span>
                 <span class="tab-dot tag-${job.status}"></span>
+                ${bridged ? '<span class="tab-bridged">⚡</span>' : ''}
             </div>`;
     }).join('');
 
-    // Build content for selected tab
     const job        = jobs[activeTab];
     const bridged    = activeBridgeIds.has(job.id);
     const propertyId = job.propertyId || job.query?.propertyId || '—';
     const county     = job.query?.county || '—';
     const state      = job.query?.state  || '—';
-    const tabLabel   = propertyId !== '—' ? propertyId : job.id.slice(0, 8);
+    const isHandoff  = job.status === 'waiting' && bridged;
+    const isDone     = ['completed', 'failed'].includes(job.status);
+    const s3Url      = job.result?.s3Url || null;
+
+    // Check if last handoff was CAPTCHA
+    const logs        = logBuffers[job.id] || [];
+    const lastHandoff = [...logs].reverse().find(l => l.level === 'HANDOFF');
+    const isCaptcha   = lastHandoff?.text?.toLowerCase().includes('captcha');
 
     const content = `
-        <div class="job-detail">
+        <div class="job-detail" id="jobDetail">
             <div class="job-detail-row">
                 <span class="job-detail-label">Property ID</span>
                 <span class="job-detail-value">${propertyId}</span>
@@ -127,31 +322,61 @@ function renderTabs(jobs, activeBridgeIds = new Set(), errorMsg = null) {
             </div>
             <div class="job-detail-row">
                 <span class="job-detail-label">Status</span>
-                <div style="display:flex;align-items:center;gap:4px;">
+                <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
                     <span class="tag tag-${job.status}">${job.status}</span>
                     ${bridged ? '<span class="tag" style="background:#dcfce7;color:#16a34a;">⚡ bridged</span>' : ''}
+                    ${isHandoff ? '<span class="tag" style="background:#fff7ed;color:#c2410c;">⏸ waiting for you</span>' : ''}
                 </div>
             </div>
-            <div class="job-detail-row">
-                <span class="job-detail-label">Job ID</span>
-                <span class="job-detail-value mono">${job.id.slice(0, 16)}...</span>
-            </div>
+            ${isHandoff ? `<div class="handoff-banner">⏸ Action required — go to the tab and complete it, then click Resume</div>` : ''}
+            ${isCaptcha && isHandoff ? `<div class="captcha-banner">🤖 CAPTCHA detected — please solve it in the tab</div>` : ''}
+            ${s3Url ? `
+            <div class="s3-result">
+                <div class="s3-label">✅ Deed PDF</div>
+                <a href="${s3Url}" target="_blank" class="s3-link">${s3Url.split('/').slice(-2).join('/')}</a>
+            </div>` : ''}
             <div class="job-actions">
-                ${job.status === 'waiting' && !bridged ? `
-                    <button class="btn btn-primary" data-action="connect" data-job="${job.id}">Connect</button>
-                ` : ''}
-                ${job.status === 'waiting' && bridged ? `
-                    <button class="btn btn-warning" data-action="resume" data-job="${job.id}">Resume</button>
-                ` : ''}
-                ${bridged ? `
-                    <button class="btn btn-secondary" data-action="disconnect" data-job="${job.id}">Disconnect</button>
-                ` : ''}
+                ${isHandoff ? `<button class="btn btn-warning" data-action="gototab" data-job="${job.id}">Go to Tab</button>` : ''}
+                ${isHandoff ? `<button class="btn btn-primary" data-action="resume" data-job="${job.id}">Resume</button>` : ''}
+                ${!isHandoff && job.status === 'waiting' && !bridged ? `<button class="btn btn-primary" data-action="connect" data-job="${job.id}">Connect</button>` : ''}
+                ${bridged && !isDone ? `<button class="btn btn-secondary" data-action="disconnect" data-job="${job.id}">Disconnect</button>` : ''}
+                ${isDone || job.status === 'failed' ? `<button class="btn btn-warning" data-action="restart" data-job="${job.id}">↺ Restart</button>` : ''}
+                <button class="btn btn-secondary" data-action="closetab" data-job="${job.id}">Dismiss</button>
             </div>
+        </div>
+        <div class="log-section">
+            <div class="log-header">Live Log</div>
+            <div class="log-feed" id="logFeed"></div>
         </div>`;
 
-    container.innerHTML = `<div class="tab-bar">${tabBar}</div>${content}`;
+    // Only update job detail if content changed — preserve log scroll
+    const existingDetail = container.querySelector('#jobDetail');
+    const existingLog    = container.querySelector('#logFeed');
+    const existingTabBar = container.querySelector('.tab-bar');
 
-    // Tab click
+    // Always update tab bar
+    const tabBarEl = document.createElement('div');
+    tabBarEl.innerHTML = `<div class="tab-bar">${tabBar}</div>`;
+
+    if (!existingDetail || !existingLog) {
+        // First render — build everything
+        container.innerHTML = `<div class="tab-bar">${tabBar}</div>${content}`;
+    } else {
+        // Update tab bar
+        existingTabBar.outerHTML = `<div class="tab-bar">${tabBar}</div>`;
+
+        // Update job detail only (not log)
+        const tempDiv = document.createElement('div');
+        tempDiv.innerHTML = content;
+        const newDetail = tempDiv.querySelector('#jobDetail');
+        existingDetail.replaceWith(newDetail);
+        // logFeed stays untouched — scroll preserved
+    }
+
+    // Render existing log buffer
+    renderLogFeed(job.id);
+
+    // Tab clicks
     container.querySelectorAll('.tab[data-tab]').forEach(t => {
         t.addEventListener('click', () => {
             activeTab = parseInt(t.dataset.tab);
@@ -167,12 +392,78 @@ function renderTabs(jobs, activeBridgeIds = new Set(), errorMsg = null) {
             if (action === 'connect')    connectBridge(jobId);
             if (action === 'resume')     resumeJob(jobId);
             if (action === 'disconnect') disconnectBridge(jobId);
+            if (action === 'gototab')    gotoTab(jobId);
+            if (action === 'closetab')   closeTab(jobId);
+            if (action === 'restart')    restartJob(jobId);
         });
     });
 }
 
+async function restartJob(jobId) {
+    const data      = await chrome.storage.local.get(['apiUrl', 'apiSecret']);
+    const apiUrl    = data.apiUrl    || 'http://localhost:4000';
+    const apiSecret = data.apiSecret || '';
+
+    try {
+        const res  = await fetch(`${apiUrl}/jobs/${jobId}`, { headers: { 'Authorization': `Bearer ${apiSecret}` } });
+        const job  = await res.json();
+
+        // Re-submit with the same query and scraper
+        const newRes = await fetch(`${apiUrl}/jobs`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiSecret}` },
+            body:    JSON.stringify({
+                scraper:    job.scraper,
+                query:      job.query,
+                webhookUrl: job.webhookUrl || null,
+            }),
+        });
+
+        if (!newRes.ok) throw new Error(`HTTP ${newRes.status}`);
+
+        // Dismiss the old job
+        await fetch(`${apiUrl}/jobs/${jobId}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${apiSecret}` } });
+        delete logBuffers[jobId];
+        disconnectLogSocket(jobId);
+
+        showToast('Job restarted ✓');
+        setTimeout(refreshJobs, 500);
+    } catch (err) {
+        showToast(`Restart failed: ${err.message}`, 'error');
+    }
+}
+
+async function gotoTab(jobId) {
+    chrome.runtime.sendMessage({ type: 'FOCUS_TAB', jobId }, (res) => {
+        if (!res?.ok) showToast(res?.error || 'Tab not found', 'error');
+    });
+}
+
+async function closeTab(jobId) {
+    const data      = await chrome.storage.local.get(['apiUrl', 'apiSecret']);
+    const apiUrl    = data.apiUrl    || 'http://localhost:4000';
+    const apiSecret = data.apiSecret || '';
+
+    // Try to close Chrome tab via background
+    chrome.runtime.sendMessage({ type: 'CLOSE_TAB', jobId }, () => {});
+
+    // Delete job from Redis so it disappears from the list
+    try {
+        await fetch(`${apiUrl}/jobs/${jobId}`, {
+            method:  'DELETE',
+            headers: { 'Authorization': `Bearer ${apiSecret}` },
+        });
+    } catch {}
+
+    // Remove from local log buffer
+    delete logBuffers[jobId];
+    disconnectLogSocket(jobId);
+
+    showToast('Job dismissed');
+    setTimeout(refreshJobs, 300);
+}
 async function connectBridge(jobId) {
-    showToast(`Connecting job ${jobId.slice(0, 8)}...`);
+    showToast(`Connecting...`);
     chrome.runtime.sendMessage({ type: 'START_BRIDGE', jobId }, (res) => {
         if (res?.ok) { showToast('Connected ✓'); refreshJobs(); }
         else showToast(res?.error || 'Failed', 'error');
@@ -189,52 +480,34 @@ async function disconnectBridge(jobId) {
 async function resumeJob(jobId) {
     chrome.runtime.sendMessage({ type: 'RESUME_JOB', jobId }, () => {
         showToast('Resumed ✓');
-        setTimeout(refreshJobs, 1000);
+        setTimeout(refreshJobs, 500);
     });
 }
 
-// ── Polling indicator ─────────────────────────────────────────────────────────
+// ── Polling indicator (kept for compatibility) ────────────────────────────────
 async function updatePollingIndicator() {
-    const state  = await new Promise(resolve => chrome.runtime.sendMessage({ type: 'GET_STATE' }, resolve));
-    const dot    = document.getElementById('pollingDot');
-    const status = document.getElementById('pollingStatus');
-
-    if (state?.polling) {
-        dot.className    = 'status-dot polling';
-        status.textContent = `polling · ${(state.bridges || []).length} active`;
-    } else {
-        dot.className    = 'status-dot';
-        status.textContent = 'stopped';
-    }
+    await updateStatusPill();
 }
 
 // ── Debugger toggle ───────────────────────────────────────────────────────────
-let debuggerAttached = true;
-
 async function updateDebuggerToggle() {
-    const state    = await new Promise(resolve => chrome.runtime.sendMessage({ type: 'GET_STATE' }, resolve));
-    const bridges  = state?.bridges || [];
-    const section  = document.getElementById('debuggerToggleSection');
-    const btn      = document.getElementById('debuggerToggleBtn');
+    const state   = await new Promise(resolve => chrome.runtime.sendMessage({ type: 'GET_STATE' }, resolve));
+    const bridges = state?.bridges || [];
+    const section = document.getElementById('debuggerToggleSection');
+    const btn     = document.getElementById('debuggerToggleBtn');
     const statusEl = document.getElementById('debuggerStatusText');
-
-    if (bridges.length === 0) {
-        section.style.display = 'none';
-        return;
-    }
-
+    if (bridges.length === 0) { section.style.display = 'none'; return; }
     section.style.display = 'block';
-
     if (debuggerAttached) {
-        statusEl.textContent  = '🟢 attached — banner visible';
-        statusEl.style.color  = '#166534';
-        btn.textContent       = 'Detach (hide banner)';
-        btn.className         = 'btn btn-secondary';
+        statusEl.textContent = '🟢 attached — banner visible';
+        statusEl.style.color = '#166534';
+        btn.textContent      = 'Detach (hide banner)';
+        btn.className        = 'btn btn-secondary';
     } else {
-        statusEl.textContent  = '⚪ detached — banner hidden';
-        statusEl.style.color  = '#666';
-        btn.textContent       = 'Re-attach';
-        btn.className         = 'btn btn-primary';
+        statusEl.textContent = '⚪ detached — banner hidden';
+        statusEl.style.color = '#666';
+        btn.textContent      = 'Re-attach';
+        btn.className        = 'btn btn-primary';
     }
 }
 
@@ -244,12 +517,12 @@ async function toggleDebugger() {
         if (res?.ok) {
             debuggerAttached = !debuggerAttached;
             updateDebuggerToggle();
-            showToast(debuggerAttached ? 'Debugger attached' : 'Debugger detached — banner hidden');
-        } else {
-            showToast(res?.error || 'Failed', 'error');
-        }
+            showToast(debuggerAttached ? 'Debugger attached' : 'Debugger detached');
+        } else showToast(res?.error || 'Failed', 'error');
     });
 }
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
 function showToast(message, type = 'success') {
     const toast = document.createElement('div');
     toast.textContent = message;
@@ -263,38 +536,45 @@ function showToast(message, type = 'success') {
     setTimeout(() => toast.remove(), 2000);
 }
 
-// ── Listen for background events ──────────────────────────────────────────────
+// ── Background events ─────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'BRIDGE_STATUS' || msg.type === 'AUTO_CONNECTING') {
         updatePollingIndicator();
+        refreshJobs();
+    }
+    if (msg.type === 'HANDOFF_REQUIRED') {
+        // Refresh to show "Go to Tab" button
         refreshJobs();
     }
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('saveBtn').addEventListener('click', saveSettings);
-    document.getElementById('refreshBtn').addEventListener('click', refreshJobs);
-    document.getElementById('debuggerToggleBtn').addEventListener('click', toggleDebugger);
-    document.getElementById('copyFlagBtn').addEventListener('click', () => {
+    document.getElementById('saveBtn')?.addEventListener('click', saveSettings);
+    document.getElementById('refreshBtn')?.addEventListener('click', refreshJobs);
+    document.getElementById('debuggerToggleBtn')?.addEventListener('click', toggleDebugger);
+    document.getElementById('copyFlagBtn')?.addEventListener('click', () => {
         navigator.clipboard.writeText('--silent-debugger-extension-api').then(() => {
-            showToast('Flag copied — relaunch Chrome with this flag to hide the banner');
+            showToast('Flag copied!');
         });
+    });
+    document.getElementById('settingsGear')?.addEventListener('click', () => {
+        document.getElementById('settingsDrawer')?.classList.toggle('open');
     });
 
     loadSettings();
-    updatePollingIndicator();
+    updateStatusPill();
     updateDebuggerToggle();
     refreshJobs();
 
-    // Auto-refresh every 5s while popup is open, but skip if user is typing
+    // Auto-refresh every 3s, skip if user is typing
     setInterval(() => {
-        const focused = document.activeElement;
+        const focused  = document.activeElement;
         const isTyping = ['apiUrl', 'apiSecret', 'bridgePort'].includes(focused?.id);
         if (!isTyping) {
-            updatePollingIndicator();
+            updateStatusPill();
             updateDebuggerToggle();
             refreshJobs();
         }
-    }, 5000);
+    }, 3000);
 });

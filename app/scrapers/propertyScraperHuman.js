@@ -583,19 +583,25 @@ class PropertyScraperHuman {
             if (!m) continue;
 
             const [, target, verb, rest] = m;
-            const payload = rest.trim();
             const t = target.toLowerCase();
+            const v = verb.toLowerCase();
 
-            // Log the action
+            // ── Extract [text="..."] comment if present ───────────────────────
+            const textMatch = rest.match(/\[text="([^"]+)"\]\s*$/);
+            const comment   = textMatch ? textMatch[1] : null;
+            const payload   = textMatch ? rest.slice(0, textMatch.index).trim() : rest.trim();
+
+            // Log the action — use comment if available
             if (this.logger) {
-                const v = verb.toLowerCase();
                 if (t === 'stagehand' && v === 'handoff') {
                     this.logger.handoff(`Waiting for human: ${payload}`);
                 } else {
-                    this.logger.action(this._actionMessage(target, verb, payload));
+                    const displayMsg = comment
+                        ? `[${t}][${v}] ${comment}`
+                        : this._actionMessage(target, verb, payload);
+                    this.logger.action(displayMsg);
                 }
             }
-            const v = verb.toLowerCase();
 
             try {
 

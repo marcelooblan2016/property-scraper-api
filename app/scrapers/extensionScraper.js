@@ -150,12 +150,19 @@ class ExtensionScraper {
             if (!m) continue;
 
             const [, target, verb, rest] = m;
-            const payload = rest.trim();
             const t = target.toLowerCase();
             const v = verb.toLowerCase();
 
-            this.logger?.action(this._actionMessage(t, v, payload));
-            console.log(`[ext] action: [${t}][${v}] ${payload}`);
+            // ── Extract [text="..."] comment if present ───────────────────────
+            const textMatch  = rest.match(/\[text="([^"]+)"\]\s*$/);
+            const comment    = textMatch ? textMatch[1] : null;
+            const payload    = textMatch ? rest.slice(0, textMatch.index).trim() : rest.trim();
+            const displayMsg = comment
+                ? `[${t}][${v}] ${comment}`
+                : this._actionMessage(t, v, payload);
+
+            this.logger?.action(displayMsg);
+            console.log(`[ext] action: [${t}][${v}] ${comment || payload}`);
 
             try {
                 await this._executeVerb(t, v, payload);
@@ -168,9 +175,8 @@ class ExtensionScraper {
                     const captcha = await this._detectCaptcha();
                     if (captcha) {
                         this.logger?.handoff(`CAPTCHA detected — human takeover needed`);
-                        await this.cmd('focusTab', {}).catch(() => {});
+                        await this.cmd('notifyHandoff', { message: `CAPTCHA detected after [${t}][${v}]. Please solve it and click Resume.` }).catch(() => {});
                         await this.onHandoff({ message: `CAPTCHA detected after [${t}][${v}]. Please solve it and click Resume to continue.` });
-                        await this.cmd('blurTab', {}).catch(() => {});
                     }
                 }
             } catch (err) {
@@ -180,6 +186,7 @@ class ExtensionScraper {
 
                 // Stop MD execution and hand off to human
                 this.logger?.handoff(`Action failed — human takeover needed: ${err.message}`);
+                await this.cmd('notifyHandoff', { message: `Action failed on: [${t}][${v}] — ${err.message}` }).catch(() => {});
                 await this.onHandoff({ message: `Action failed on: [${t}][${v}] ${payload} — ${err.message}. Please complete manually then click Resume.` });
                 // Continue from next action after resume
             }
@@ -199,8 +206,8 @@ class ExtensionScraper {
             await this.onComplete({ filePath: null, s3Key: null, s3Url: null });
         }
 
-        // Signal extension to close the tab
-        await this.cmd('closeTab', {}).catch(() => {});
+        // Tab stays open — user closes manually via extension popup
+        this.logger?.info('Job finished — close the tab manually from the extension when ready.');
     }
 
     // ── Execute verb ──────────────────────────────────────────────────────────
@@ -292,18 +299,9 @@ class ExtensionScraper {
 
         if (target === 'stagehand') {
             if (verb === 'handoff') {
-                // Bring tab to front so human can interact
-                try {
-                    await this.cmd('focusTab', {});
-                    this.logger?.info('Tab brought to front for handoff');
-                } catch (err) {
-                    console.warn('[ext][handoff] focusTab failed:', err.message);
-                }
+                // Notify extension to show "Go to Tab" button — no auto-focus
+                await this.cmd('notifyHandoff', { message: payload }).catch(() => {});
                 await this.onHandoff({ message: payload });
-                // Push tab back to background after resume
-                try {
-                    await this.cmd('blurTab', {});
-                } catch {}
                 return;
             }
             if (verb === 'act') {

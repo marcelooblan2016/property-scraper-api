@@ -64,6 +64,14 @@ router.post('/', async (req, res) => {
     return res.status(202).json({ jobId: job.id, status: 'queued' });
 });
 
+// ── DELETE /jobs/:id ──────────────────────────────────────────────────────────
+router.delete('/:id', async (req, res) => {
+    const { redis } = require('../store/jobStore');
+    await redis.srem('jobs:index', req.params.id);
+    await redis.del(`job:${req.params.id}`);
+    return res.json({ ok: true, deleted: req.params.id });
+});
+
 // ── DELETE /jobs ──────────────────────────────────────────────────────────────
 // Clear all jobs from Redis (dev/debug only)
 router.delete('/', async (req, res) => {
