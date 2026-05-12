@@ -148,23 +148,21 @@ function renderLogFeed(jobId) {
 
     const lines = logBuffers[jobId] || [];
 
-    // Track rendered count per job to avoid full re-render on no changes
-    const prevCount = parseInt(logEl.dataset.lineCount || '0');
-    const newLines  = lines.slice(prevCount);
+    // Job switched — clear and reset
+    if (logEl.dataset.jobId !== jobId) {
+        logEl.dataset.jobId     = jobId;
+        logEl.dataset.lineCount = '0';
+        logEl.innerHTML         = '';
+    }
 
     if (lines.length === 0) {
         logEl.innerHTML = '<div class="log-empty">No logs yet...</div>';
-        logEl.dataset.jobId      = jobId;
-        logEl.dataset.lineCount  = '0';
         return;
     }
 
-    // First render or job switch — full render
-    if (logEl.dataset.jobId !== jobId || prevCount === 0) {
-        logEl.dataset.jobId     = jobId;
-        logEl.dataset.lineCount = '0';
-        logEl.innerHTML = '';
-    }
+    // Compute new lines AFTER potential reset
+    const prevCount = parseInt(logEl.dataset.lineCount || '0');
+    const newLines  = lines.slice(prevCount);
 
     // No new lines — do nothing, preserve scroll
     if (newLines.length === 0) return;
@@ -175,8 +173,8 @@ function renderLogFeed(jobId) {
     // Append only new lines
     const fragment = document.createDocumentFragment();
     for (const l of newLines) {
-        const cls  = levelClass(l.level);
-        const div  = document.createElement('div');
+        const cls = levelClass(l.level);
+        const div = document.createElement('div');
         div.className = `log-line ${cls}`;
         div.innerHTML = `<span class="log-time">${l.time}</span><span class="log-level">${l.level}</span><span class="log-text">${escHtml(l.text)}</span>`;
         fragment.appendChild(div);
@@ -266,51 +264,51 @@ function renderTabs(jobs, activeBridgeIds = new Set(), errorMsg = null) {
         return;
     }
     if (jobs.length === 0) {
-        container.innerHTML = `
-            <div class="tab-bar">
-                <div class="tab tab-empty">—</div>
-                <div class="tab tab-empty">—</div>
-                <div class="tab tab-empty">—</div>
-            </div>
-            <div class="empty">No active jobs</div>`;
+        container.innerHTML = `<div class="empty">No active jobs</div>`;
         return;
     }
 
     if (activeTab >= jobs.length) activeTab = 0;
 
-    const tabBar = Array.from({ length: 3 }, (_, i) => {
-        const job = jobs[i];
-        if (!job) return `<div class="tab tab-empty">—</div>`;
-        const propertyId = job.propertyId || job.query?.propertyId || job.id.slice(0, 8);
+    // ── Vertical job list ─────────────────────────────────────────────────────
+    const jobListHtml = jobs.map((job, i) => {
+        const propertyId = job.propertyId || job.query?.propertyId || '—';
+        const label      = propertyId !== '—' ? `79-${propertyId}-47` : job.id.slice(0, 8);
         const isActive   = i === activeTab;
         const bridged    = activeBridgeIds.has(job.id);
+        const county     = job.query?.county || '';
+        const state      = job.query?.state  || '';
         return `
-            <div class="tab ${isActive ? 'active' : ''}" data-tab="${i}" title="${job.id}">
-                <span class="tab-property">${propertyId}</span>
-                <span class="tab-dot tag-${job.status}"></span>
-                ${bridged ? '<span class="tab-bridged">⚡</span>' : ''}
-            </div>`;
+            <a class="job-list-item ${isActive ? 'active' : ''}" data-tab="${i}" href="#">
+                <span class="job-list-dot tag-${job.status}"></span>
+                <span class="job-list-body">
+                    <span class="job-list-label">${label}</span>
+                    <span class="job-list-meta">${county}${county && state ? ', ' : ''}${state}</span>
+                </span>
+                ${bridged ? '<span class="job-list-bridged">⚡</span>' : ''}
+            </a>`;
     }).join('');
 
+    // ── Job detail ────────────────────────────────────────────────────────────
     const job        = jobs[activeTab];
     const bridged    = activeBridgeIds.has(job.id);
     const propertyId = job.propertyId || job.query?.propertyId || '—';
+    const label      = propertyId !== '—' ? `79-${propertyId}-47` : job.id.slice(0, 8);
     const county     = job.query?.county || '—';
     const state      = job.query?.state  || '—';
     const isHandoff  = job.status === 'waiting' && bridged;
     const isDone     = ['completed', 'failed'].includes(job.status);
     const s3Url      = job.result?.s3Url || null;
 
-    // Check if last handoff was CAPTCHA
     const logs        = logBuffers[job.id] || [];
     const lastHandoff = [...logs].reverse().find(l => l.level === 'HANDOFF');
     const isCaptcha   = lastHandoff?.text?.toLowerCase().includes('captcha');
 
-    const content = `
+    const detail = `
         <div class="job-detail" id="jobDetail">
             <div class="job-detail-row">
                 <span class="job-detail-label">Property ID</span>
-                <span class="job-detail-value">${propertyId}</span>
+                <a href="https://titlesearch.afxllc.com/projects/${propertyId}" target="_blank" class="job-detail-link">${label}</a>
             </div>
             <div class="job-detail-row">
                 <span class="job-detail-label">County</span>
@@ -349,37 +347,26 @@ function renderTabs(jobs, activeBridgeIds = new Set(), errorMsg = null) {
             <div class="log-feed" id="logFeed"></div>
         </div>`;
 
-    // Only update job detail if content changed — preserve log scroll
+    // Preserve log feed across refreshes
+    const existingList   = container.querySelector('.job-list');
     const existingDetail = container.querySelector('#jobDetail');
     const existingLog    = container.querySelector('#logFeed');
-    const existingTabBar = container.querySelector('.tab-bar');
-
-    // Always update tab bar
-    const tabBarEl = document.createElement('div');
-    tabBarEl.innerHTML = `<div class="tab-bar">${tabBar}</div>`;
 
     if (!existingDetail || !existingLog) {
-        // First render — build everything
-        container.innerHTML = `<div class="tab-bar">${tabBar}</div>${content}`;
+        container.innerHTML = `<div class="job-list">${jobListHtml}</div>${detail}`;
     } else {
-        // Update tab bar
-        existingTabBar.outerHTML = `<div class="tab-bar">${tabBar}</div>`;
-
-        // Update job detail only (not log)
+        existingList.innerHTML = jobListHtml;
         const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = content;
-        const newDetail = tempDiv.querySelector('#jobDetail');
-        existingDetail.replaceWith(newDetail);
-        // logFeed stays untouched — scroll preserved
+        tempDiv.innerHTML = detail;
+        existingDetail.replaceWith(tempDiv.querySelector('#jobDetail'));
+        // logFeed untouched — scroll preserved
     }
 
-    // Render existing log buffer
-    renderLogFeed(job.id);
-
-    // Tab clicks
-    container.querySelectorAll('.tab[data-tab]').forEach(t => {
-        t.addEventListener('click', () => {
-            activeTab = parseInt(t.dataset.tab);
+    // Job list clicks
+    container.querySelectorAll('.job-list-item[data-tab]').forEach(a => {
+        a.addEventListener('click', (e) => {
+            e.preventDefault();
+            activeTab = parseInt(a.dataset.tab);
             refreshJobs();
         });
     });
@@ -397,6 +384,8 @@ function renderTabs(jobs, activeBridgeIds = new Set(), errorMsg = null) {
             if (action === 'restart')    restartJob(jobId);
         });
     });
+
+    renderLogFeed(job.id);
 }
 
 async function restartJob(jobId) {
