@@ -89,6 +89,42 @@ router.get('/', async (req, res) => {
     return res.json(jobs.map(serializeJob));
 });
 
+
+// ── GET /dataset/check?state=FL&county=DIXIE ─────────────────────────────────
+// Must be before /:id to avoid being matched as a job ID
+router.get('/dataset/check', (req, res) => {
+    const state  = (req.query.state  || '').trim().toUpperCase();
+    const county = (req.query.county || '').trim().toUpperCase().replace(/\s+/g, '_');
+
+    if (!state || !county) {
+        return res.status(400).json({ ok: false, error: 'state and county are required' });
+    }
+
+    const datasetDir  = path.join(process.cwd(), 'dataset', state);
+    const countyFile  = path.join(datasetDir, `${county}.md`);
+    const defaultFile = path.join(datasetDir, 'DEFAULT.md');
+    const countiesTxt = path.join(datasetDir, 'counties.txt');
+
+    // 1. Exact county file
+    if (fs.existsSync(countyFile)) {
+        return res.json({ ok: true, match: 'exact', file: `dataset/${state}/${county}.md` });
+    }
+
+    // 2. DEFAULT.md + counties.txt
+    if (fs.existsSync(defaultFile) && fs.existsSync(countiesTxt)) {
+        const counties = fs.readFileSync(countiesTxt, 'utf8')
+            .split('\n')
+            .map(l => l.trim().toUpperCase().replace(/\s+/g, '_'))
+            .filter(Boolean);
+        if (counties.includes(county)) {
+            return res.json({ ok: true, match: 'default', file: `dataset/${state}/DEFAULT.md`, county });
+        }
+    }
+
+    // 3. Not found
+    return res.status(404).json({ ok: false, error: `County ${county}, ${state} is not supported` });
+});
+
 // ── GET /jobs/:id ─────────────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
     const job = await getJob(req.params.id);
