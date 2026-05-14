@@ -146,7 +146,7 @@ class ExtensionScraper {
             if (this.abortActions) break;
 
             let line = this.helper.replaceVariables(String(raw).trim(), this.query);
-            const m  = line.match(/^\[(\w+)\]\[(\w+)\]\s*(.*)$/);
+            const m  = line.match(/^\[(\w+)\]\[([\w-]+)\]\s*(.*)$/);
             if (!m) continue;
 
             const [, target, verb, rest] = m;
@@ -167,18 +167,6 @@ class ExtensionScraper {
             try {
                 await this._executeVerb(t, v, payload);
                 this.logger?.internal(line, 'ok');
-
-                // Wait for page to settle before checking for CAPTCHA
-                // Skip for pure wait actions — nothing changed
-                if (v !== 'waitfor' && !this._noCaptchaDetection) {
-                    await this._waitForPageReady();
-                    const captcha = await this._detectCaptcha();
-                    if (captcha) {
-                        this.logger?.handoff(`CAPTCHA detected — human takeover needed`);
-                        await this.cmd('notifyHandoff', { message: `CAPTCHA detected after [${t}][${v}]. Please solve it and click Resume.` }).catch(() => {});
-                        await this.onHandoff({ message: `CAPTCHA detected after [${t}][${v}]. Please solve it and click Resume to continue.` });
-                    }
-                }
             } catch (err) {
                 console.error(`[ext] action failed: ${line}`, err.message);
                 this.logger?.internal(line, 'error', err.message);
@@ -215,6 +203,7 @@ class ExtensionScraper {
 
         if (target === 'page') {
             if (verb === 'goto') {
+                this._captchaCooldownUntil = null; // reset on new page
                 await this.cmd('goto', { url: payload }, 60000);
                 return;
             }
@@ -252,27 +241,85 @@ class ExtensionScraper {
                 return;
             }
             if (verb === 'evaluate' || verb === 'execute') {
-                await this.cmd('evaluate', { expression: payload });
+                const result = await this.cmd('evaluate', { expression: payload });
+                if (result?.value === false) {
+                    throw new Error(`Action returned false: ${payload.slice(0, 80)}...`);
+                }
                 return;
             }
             if (verb === 'do') {
-                // [page][do] uses Playwright syntax — convert to vanilla JS
+                // [page][do] — convert Playwright syntax to vanilla JS
+                // Only dispatch 'input' NOT 'change' to avoid triggering form auto-submit/reload
                 let converted = payload
                     .replace(/await page\.type\((['"`])(.+?)\1,\s*(['"`])(.+?)\3\)/g,
-                        "(function(){ var el = document.querySelector('$2'); if(!el) return false; el.click(); el.focus(); el.value=''; el.value='$4'; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return true; })()")
+                        "(function(){ var el = document.querySelector('$2'); if(!el) return false; el.click(); el.focus(); el.value=''; el.value='$4'; el.dispatchEvent(new Event('input',{bubbles:true})); return true; })()")
                     .replace(/await page\.click\((['"`])(.+?)\1\)/g,
                         "(function(){ var el = document.querySelector('$2'); if(!el) return false; el.click(); return true; })()");
 
-                // If still contains await/page references, strip them for evaluate context
                 if (converted.includes('await') || converted.includes('page.')) {
                     converted = converted.replace(/\bawait\s+/g, '').replace(/\bpage\./g, 'document.');
                 }
 
-                await this.cmd('evaluate', { expression: converted });
+                const result = await this.cmd('evaluate', { expression: converted });
+                if (result?.value === false) {
+                    throw new Error(`Element not found: ${payload}`);
+                }
                 return;
             }
             if (verb === 'waitforurl') {
                 await this.cmd('waitForUrl', { fragment: payload, timeout: 30000 }, 35000);
+                // Close any extra tabs that opened during navigation
+                await this.cmd('closeExtraTabs', {}).catch(() => {});
+                return;
+            }
+            if (verb === 'wait-download' || verb === 'waitdownload') {
+                // payload: "./path/to/file.pdf" or "./path/to/file.pdf 300000"
+                const parts   = payload.trim().split(/\s+/);
+                const savePath = parts[0];
+                const timeout  = parseInt(parts[1]) || 120000; // default 2 min
+                this.logger?.info(`Waiting for human to download PDF (timeout: ${timeout/1000}s)...`);
+                const result = await this.cmd('waitDownload', { timeout }, timeout + 5000);
+                if (!result?.base64) throw new Error('No file received from wait-download');
+                const buf      = Buffer.from(result.base64, 'base64');
+                const fullPath = path.resolve(savePath);
+                await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+                await fs.promises.writeFile(fullPath, buf);
+                this.logger?.info(`File captured: ${savePath} (${buf.length} bytes)`);
+                this._downloadedFile = fullPath;
+                return;
+            }
+            if (verb === 'download-href' || verb === 'downloadhref') {
+                const [selector, savePath] = payload.split('->').map(s => s.trim());
+                // Get href — either from window.__samHref (set by previous evaluate) or from DOM selector
+                const result = await this.cmd('evaluate', {
+                    expression: selector === '__samhref' || selector === '__samHref'
+                        ? `window.__samHref || null`
+                        : `(function(){ var el = document.querySelector(${JSON.stringify(selector)}); if(!el) return null; return el.getAttribute('href') || el.href || null; })()`,
+                });
+                const href = result?.value;
+                if (!href) throw new Error(`No href found: ${selector}`);
+                this.logger?.info(`Downloading from href: ${href}`);
+                const dlResult = await this.cmd('fetchDownload', { url: href });
+                if (!dlResult?.base64) throw new Error('No data received from download');
+                const buf      = Buffer.from(dlResult.base64, 'base64');
+                const fullPath = path.resolve(savePath);
+                await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+                await fs.promises.writeFile(fullPath, buf);
+                this.logger?.info(`PDF downloaded: ${savePath} (${buf.length} bytes)`);
+                this._downloadedFile = fullPath;
+                return;
+            }
+            if (verb === 'captcha-detection' || verb === 'captchadetection') {
+                await this._waitForPageReady();
+                const captcha = await this._detectCaptcha();
+                if (captcha) {
+                    this.logger?.handoff(`CAPTCHA detected — human takeover needed`);
+                    await this.cmd('notifyHandoff', { message: `CAPTCHA detected. Please solve it and click Resume to continue.` }).catch(() => {});
+                    await this.onHandoff({ message: `CAPTCHA detected. Please solve it and click Resume to continue.` });
+                    this._captchaCooldownUntil = Date.now() + 30000;
+                } else {
+                    this.logger?.info('No CAPTCHA detected — continuing');
+                }
                 return;
             }
             if (verb === 'waitforselector') {
@@ -281,18 +328,22 @@ class ExtensionScraper {
                         const start = Date.now();
                         const check = () => {
                             if (document.querySelector(${JSON.stringify(payload)})) resolve(true);
-                            else if (Date.now() - start > 15000) reject(new Error('Selector timeout'));
-                            else setTimeout(check, 300);
+                            else if (Date.now() - start > 30000) reject(new Error('Selector timeout: ${payload}'));
+                            else setTimeout(check, 500);
                         };
                         check();
                     })`,
-                }, 20000);
+                }, 35000);
                 return;
             }
             if (verb === 'press') {
                 await this.cmd('evaluate', {
                     expression: `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(payload)}, bubbles: true }))`,
                 });
+                return;
+            }
+            if (verb === 'expect-newtab' || verb === 'expectnewtab') {
+                await this.cmd('expectNewTab', {});
                 return;
             }
         }
@@ -403,6 +454,9 @@ ${html.slice(0, 5000)}`,
 
     // ── Wait for page to be fully ready ──────────────────────────────────────
     async _waitForPageReady(timeoutMs = 8000) {
+        // Record current tab count to detect unexpected new tabs
+        const startTabCount = await this.cmd('evaluate', { expression: 'window.name || "main"' }).catch(() => null);
+
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
             try {
@@ -410,7 +464,6 @@ ${html.slice(0, 5000)}`,
                     expression: `document.readyState === 'complete' && !!document.body`,
                 });
                 if (result?.value === true) {
-                    // Extra wait for JS-injected elements (CAPTCHA, SPA renders)
                     await new Promise(r => setTimeout(r, 800));
                     return;
                 }
@@ -458,6 +511,7 @@ ${html.slice(0, 5000)}`,
             if (verb === 'spaclick')        return `Clicking (SPA): ${payload}`;
             if (verb === 'waitforurl')      return `Waiting for URL: ${payload}`;
             if (verb === 'waitforselector') return `Waiting for element: ${payload}`;
+            if (verb === 'captcha-detection' || verb === 'captchadetection') return `Checking for CAPTCHA...`;
             if (verb === 'press')           return `Pressing key: ${payload}`;
             if (verb === 'downloadnewtab')  return `Downloading PDF → ${payload}`;
             if (verb === 'catchpdf')        return `Catching PDF from network → ${payload}`;

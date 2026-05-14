@@ -332,7 +332,7 @@ class PropertyScraper {
             line = this.helper.replaceVariables(line, this.query);
             console.info('[debug-xx] executing action:', line);
 
-            const m = line.match(/^\[(\w+)\]\[(\w+)\]\s*(.*)$/);
+            const m = line.match(/^\[(\w+)\]\[([\w-]+)\]\s*(.*)$/);
             if (!m) continue;
 
             const [, target, verb, rest] = m;

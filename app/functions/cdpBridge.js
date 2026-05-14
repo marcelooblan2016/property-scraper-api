@@ -84,17 +84,45 @@ class CdpBridge {
         ws.on('close', () => {
             console.log(`[cdpBridge] extension disconnected | job: ${jobId}`);
             this.extensions.delete(jobId);
+            // Store reconnect resolver so sendCommand can wait for reconnect
+            // Extension auto-reconnects via polling within 5s
+        });
+    }
+
+    // ── Wait for extension to reconnect (used mid-job) ────────────────────────
+    waitForReconnect(jobId, timeoutMs = 15000) {
+        const existing = this.extensions.get(jobId);
+        if (existing?.readyState === WebSocket.OPEN) return Promise.resolve(existing);
+
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.resolvers.delete(jobId);
+                reject(new Error('Extension reconnect timeout'));
+            }, timeoutMs);
+
+            this.resolvers.set(jobId, (ws) => {
+                clearTimeout(timer);
+                resolve(ws);
+            });
         });
     }
 
     // ── Send command to extension ─────────────────────────────────────────────
-    sendCommand(jobId, action, params = {}, timeoutMs = 30000) {
-        return new Promise((resolve, reject) => {
-            const ws = this.extensions.get(jobId);
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                return reject(new Error(`Extension not connected for job: ${jobId}`));
-            }
+    async sendCommand(jobId, action, params = {}, timeoutMs = 30000) {
+        let ws = this.extensions.get(jobId);
 
+        // If not connected, wait up to 15s for reconnect before failing
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            console.log(`[cdpBridge] extension not connected for job: ${jobId} — waiting for reconnect...`);
+            try {
+                ws = await this.waitForReconnect(jobId, 15000);
+                console.log(`[cdpBridge] extension reconnected | job: ${jobId}`);
+            } catch {
+                throw new Error(`Extension not connected for job: ${jobId}`);
+            }
+        }
+
+        return new Promise((resolve, reject) => {
             const id    = ++this._cmdId;
             const timer = setTimeout(() => {
                 this.pending.delete(id);

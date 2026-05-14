@@ -579,7 +579,7 @@ class PropertyScraperHuman {
             let line = this.helper.replaceVariables(String(raw).trim(), this.query);
             console.info('[human] action:', line);
 
-            const m = line.match(/^\[(\w+)\]\[(\w+)\]\s*(.*)$/);
+            const m = line.match(/^\[(\w+)\]\[([\w-]+)\]\s*(.*)$/);
             if (!m) continue;
 
             const [, target, verb, rest] = m;

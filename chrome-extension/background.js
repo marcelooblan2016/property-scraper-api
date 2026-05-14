@@ -14,10 +14,36 @@
 
 // Map<jobId, { tabId, jobId, ws }> — supports multiple concurrent jobs
 const activeBridges = new Map();
-const tabRegistry   = new Map(); // jobId → tabId (persists after bridge closes)
+const tabRegistry   = new Map();
+const reconnecting  = new Set(); // jobs currently reconnecting — don't auto-connect new tab
 let pollInterval    = null;
 let autoConnected   = new Set();
 const manuallyDisconnected = new Set(); // jobs user explicitly disconnected // track jobs we already auto-connected
+
+// ── Client ID — unique per browser installation ───────────────────────────────
+async function getClientId() {
+    const data = await chrome.storage.local.get(['uuid', 'clientId']);
+    // Migrate old clientId key to uuid
+    if (!data.uuid && data.clientId) {
+        await chrome.storage.local.set({ uuid: data.clientId });
+        await chrome.storage.local.remove('clientId');
+        console.log(`[bridge] migrated clientId → uuid: ${data.clientId}`);
+        return data.clientId;
+    }
+    if (data.uuid) return data.uuid;
+    const id = crypto.randomUUID();
+    await chrome.storage.local.set({ uuid: id });
+    console.log(`[bridge] generated new uuid: ${id}`);
+    return id;
+}
+
+// Force reset uuid — call this if two browsers end up with same ID
+async function resetClientId() {
+    const id = crypto.randomUUID();
+    await chrome.storage.local.set({ uuid: id });
+    console.log(`[bridge] reset uuid: ${id}`);
+    return id;
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 async function getConfig() {
@@ -69,13 +95,15 @@ async function startBridge(jobId) {
     await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {});
     await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {});
     await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
+
     console.log(`[bridge] debugger attached to tab ${tabId}`);
 
     // Notify Node
+    const uuid = await getClientId();
     await fetch(`${config.apiUrl}/jobs/${jobId}/bridge-ready`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiSecret}` },
-        body:    JSON.stringify({ tabId, bridgePort: config.bridgePort }),
+        body:    JSON.stringify({ tabId, bridgePort: config.bridgePort, uuid }),
     });
 
     // Connect WebSocket
@@ -101,13 +129,26 @@ async function startBridge(jobId) {
 
     ws.onclose = () => {
         console.log(`[bridge] WS closed | job: ${jobId}`);
-        stopBridge(jobId);
+        const bridge = activeBridges.get(jobId);
+        if (bridge && bridge.ws === ws) {
+            activeBridges.delete(jobId);
+            notifyPopup('BRIDGE_STATUS', { status: 'disconnected', jobId });
+        }
     };
 
     ws.onerror = () => {
         console.error(`[bridge] WS error | job: ${jobId}`);
-        stopBridge(jobId);
     };
+
+    // Keepalive ping every 10s to prevent WS timeout during long operations
+    const pingInterval = setInterval(() => {
+        const bridge = activeBridges.get(jobId);
+        if (!bridge || bridge.ws?.readyState !== WebSocket.OPEN) {
+            clearInterval(pingInterval);
+            return;
+        }
+        bridge.ws.send(JSON.stringify({ type: 'ping' }));
+    }, 10000);
 
     // Forward CDP events → Node
     chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -117,21 +158,41 @@ async function startBridge(jobId) {
         }
     });
 
-    // Auto-reattach on unexpected detach
+    // Auto-reattach on unexpected detach — do NOT stop bridge
     chrome.debugger.onDetach.addListener(async (source, reason) => {
         if (source.tabId !== tabId) return;
-        if (!activeBridges.has(jobId)) return;
-        if (reason === 'target_closed') { stopBridge(jobId); return; }
+        if (reason === 'target_closed') {
+            console.log(`[bridge] tab ${tabId} closed | job: ${jobId}`);
+            stopBridge(jobId);
+            return;
+        }
         console.log(`[bridge] debugger detached (${reason}) — reattaching tab ${tabId}...`);
+        reconnecting.add(jobId);
         try {
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 100));
+
+            // Close any extra tabs that opened (e.g. window.open from the site)
+            const allTabs = await chrome.tabs.query({});
+            for (const t of allTabs) {
+                if (t.id !== tabId && t.id > tabId &&
+                    !t.url?.startsWith('chrome-extension://') &&
+                    !t.url?.startsWith('chrome://')) {
+                    console.log(`[bridge] closing extra tab: ${t.id} ${t.url}`);
+                    await chrome.tabs.remove(t.id).catch(() => {});
+                }
+            }
+
             await chrome.debugger.attach({ tabId }, '1.3');
             await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {});
             await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {});
             await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
+
             console.log(`[bridge] debugger re-attached | tab ${tabId}`);
         } catch (err) {
             console.error('[bridge] re-attach failed:', err.message);
+            stopBridge(jobId);
+        } finally {
+            reconnecting.delete(jobId);
         }
     });
 
@@ -254,83 +315,235 @@ async function executeCommand(tabId, cmd, jobId) {
             return { ok: true };
         }
 
-        case 'downloadnewtab': {
-            // Find the most recently opened tab (the PDF viewer tab)
-            // We look for a tab that was opened after our bot tab
-            const allTabs = await chrome.tabs.query({});
+        case 'waitDownload': {
+            const timeout = params.timeout || 120000; // 2 min for human to download
 
-            // Sort by id descending — newest tab has highest id
-            const sortedTabs = allTabs
-                .filter(t => t.id !== tabId) // not our bot tab
-                .sort((a, b) => b.id - a.id);
+            const pdfData = await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    chrome.debugger.onEvent.removeListener(onEvent);
+                    reject(new Error('Wait download timeout — no PDF downloaded within 2 minutes'));
+                }, timeout);
 
-            let pdfTab = sortedTabs[0]; // most recently opened tab
+                const reqIds = new Map(); // requestId → url
 
-            // If no other tab yet, wait for one to appear
-            if (!pdfTab || pdfTab.status !== 'complete') {
-                pdfTab = await new Promise((resolve, reject) => {
-                    const timer = setTimeout(() => reject(new Error('New tab timeout — PDF tab did not open')), 15000);
+                function onEvent(source, method, eventParams) {
+                    if (source.tabId !== tabId) return;
 
-                    // Check for existing loading tabs first
-                    chrome.tabs.query({}, (tabs) => {
-                        const candidate = tabs
-                            .filter(t => t.id !== tabId)
-                            .sort((a, b) => b.id - a.id)[0];
-                        if (candidate) {
-                            if (candidate.status === 'complete') {
-                                clearTimeout(timer);
-                                resolve(candidate);
-                                return;
-                            }
-                            // Wait for it to finish loading
-                            function onUpdated(updatedTabId, info) {
-                                if (updatedTabId === candidate.id && info.status === 'complete') {
-                                    chrome.tabs.onUpdated.removeListener(onUpdated);
-                                    clearTimeout(timer);
-                                    chrome.tabs.get(candidate.id, resolve);
-                                }
-                            }
-                            chrome.tabs.onUpdated.addListener(onUpdated);
-                        } else {
-                            // No tab yet — wait for creation
-                            function onCreated(tab) {
-                                chrome.tabs.onCreated.removeListener(onCreated);
-                                function onUpdated(updatedTabId, info) {
-                                    if (updatedTabId === tab.id && info.status === 'complete') {
-                                        chrome.tabs.onUpdated.removeListener(onUpdated);
-                                        clearTimeout(timer);
-                                        chrome.tabs.get(tab.id, resolve);
-                                    }
-                                }
-                                chrome.tabs.onUpdated.addListener(onUpdated);
-                            }
-                            chrome.tabs.onCreated.addListener(onCreated);
+                    if (method === 'Network.responseReceived') {
+                        const mime = eventParams.response?.mimeType || '';
+                        const url  = eventParams.response?.url || '';
+                        if (mime.includes('pdf') || url.includes('.pdf') || mime.includes('octet-stream')) {
+                            reqIds.set(eventParams.requestId, url);
                         }
+                    }
+
+                    if (method === 'Network.loadingFinished' && reqIds.has(eventParams.requestId)) {
+                        const url = reqIds.get(eventParams.requestId);
+                        chrome.debugger.sendCommand(
+                            { tabId },
+                            'Network.getResponseBody',
+                            { requestId: eventParams.requestId }
+                        ).then(body => {
+                            chrome.debugger.onEvent.removeListener(onEvent);
+                            clearTimeout(timer);
+                            resolve({ body, url });
+                        }).catch(() => {});
+                    }
+                }
+
+                chrome.debugger.onEvent.addListener(onEvent);
+            });
+
+            const base64 = pdfData.body.base64Encoded
+                ? pdfData.body.body
+                : btoa(pdfData.body.body);
+
+            console.log(`[bridge] wait-download caught: ${pdfData.url}`);
+            return { ok: true, base64, url: pdfData.url };
+        }
+
+        case 'expectNewTab': {
+            const bridge = activeBridges.get(jobId);
+            if (bridge) bridge.expectingNewTab = true;
+            // Temporarily restore window.open so target="new" links work
+            await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+                expression: `if(window.__samOrigOpen) { window.open = window.__samOrigOpen; } else { delete window.open; }`,
+                returnByValue: false,
+            }).catch(() => {});
+            console.log(`[bridge] expecting new tab | job: ${jobId}`);
+            return { ok: true };
+        }
+
+        case 'fetchDownload': {
+            const res = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+                expression: `(async function(){
+                    const url = new URL(${JSON.stringify(params.url)}, location.href).href;
+                    const r = await fetch(url, {
+                        credentials: 'include',
+                        headers: { 'Referer': location.href, 'Accept': 'application/pdf,*/*' }
                     });
+                    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + url);
+                    const contentType = r.headers.get('content-type') || '';
+                    if (contentType.includes('html')) {
+                        const text = await r.text();
+                        // Find PDF URL in the HTML — look for embed/iframe/anchor with pdf
+                        let pdfUrl = null;
+                        const tags = ['embed src=', 'iframe src=', 'object data='];
+                        for (const tag of tags) {
+                            const idx = text.indexOf(tag);
+                            if (idx === -1) continue;
+                            const start = text.indexOf('"', idx + tag.length) + 1;
+                            const end   = text.indexOf('"', start);
+                            if (start > 0 && end > start) {
+                                pdfUrl = text.slice(start, end);
+                                break;
+                            }
+                        }
+                        // Also check for window.location or direct PDF links
+                        if (!pdfUrl) {
+                            const idx = text.indexOf('.pdf');
+                            if (idx > -1) {
+                                const s = text.lastIndexOf('"', idx) + 1;
+                                const e = text.indexOf('"', idx);
+                                if (s > 0 && e > s) pdfUrl = text.slice(s, e);
+                            }
+                        }
+                        if (!pdfUrl) {
+                            // Return HTML for debugging
+                            throw new Error('Could not find PDF URL in viewer. Content: ' + text.slice(0, 200));
+                        }
+                        pdfUrl = new URL(pdfUrl, location.href).href;
+                        const r2    = await fetch(pdfUrl, { credentials: 'include' });
+                        if (!r2.ok) throw new Error('PDF fetch failed: HTTP ' + r2.status);
+                        const buf2  = await r2.arrayBuffer();
+                        const u2    = new Uint8Array(buf2);
+                        let b2 = '';
+                        for (let i = 0; i < u2.length; i += 8192)
+                            b2 += String.fromCharCode(...u2.subarray(i, i + 8192));
+                        return JSON.stringify({ base64: btoa(b2), size: u2.length, url: pdfUrl });
+                    }
+                    const buf  = await r.arrayBuffer();
+                    const u    = new Uint8Array(buf);
+                    let b = '';
+                    for (let i = 0; i < u.length; i += 8192)
+                        b += String.fromCharCode(...u.subarray(i, i + 8192));
+                    return JSON.stringify({ base64: btoa(b), size: u.length, url: r.url });
+                })()`,
+                awaitPromise:  true,
+                returnByValue: true,
+            });
+            if (res.exceptionDetails) {
+                throw new Error(res.exceptionDetails?.exception?.description || 'fetchDownload failed');
+            }
+            const raw = res.result?.value;
+            if (!raw) throw new Error('fetchDownload: empty response');
+            const parsed = JSON.parse(raw);
+            console.log(`[bridge] fetchDownload: ${parsed.size} bytes from ${parsed.url}`);
+            return { ok: true, base64: parsed.base64, url: parsed.url };
+        }
+
+        case 'downloadnewtab': {
+            const pdfTimeout = params.timeout || 20000;
+            const startTime  = Date.now();
+
+            // Record existing tabs before we start
+            const existingTabs  = await chrome.tabs.query({});
+            const existingIds   = new Set(existingTabs.map(t => t.id));
+
+            const pdfTab = await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    chrome.tabs.onCreated.removeListener(onCreated);
+                    chrome.tabs.onUpdated.removeListener(onUpdated);
+                    reject(new Error('New tab timeout — PDF tab did not open'));
+                }, pdfTimeout);
+
+                // Check if a new tab already opened between evaluate and now
+                chrome.tabs.query({}, (allTabs) => {
+                    const newTab = allTabs
+                        .filter(t => !existingIds.has(t.id) && t.id !== tabId)
+                        .sort((a, b) => b.id - a.id)[0];
+
+                    if (newTab) {
+                        clearTimeout(timer);
+                        if (newTab.status === 'complete') {
+                            resolve(newTab);
+                        } else {
+                            function onUpdatedExisting(updatedTabId, info) {
+                                if (updatedTabId !== newTab.id) return;
+                                if (info.status === 'complete') {
+                                    chrome.tabs.onUpdated.removeListener(onUpdatedExisting);
+                                    chrome.tabs.get(newTab.id, t => resolve(t));
+                                }
+                            }
+                            chrome.tabs.onUpdated.addListener(onUpdatedExisting);
+                        }
+                        return;
+                    }
+
+                    // No new tab yet — wait for one
+                    function onCreated(tab) {
+                        if (tab.id === tabId) return;
+                        chrome.tabs.onCreated.removeListener(onCreated);
+                        clearTimeout(timer);
+
+                        if (tab.status === 'complete' && tab.url && !tab.url.startsWith('about:')) {
+                            resolve(tab);
+                            return;
+                        }
+                        function onUpdated(updatedTabId, info) {
+                            if (updatedTabId !== tab.id) return;
+                            if (info.status === 'complete') {
+                                chrome.tabs.onUpdated.removeListener(onUpdated);
+                                chrome.tabs.get(tab.id, t => resolve(t));
+                            }
+                        }
+                        chrome.tabs.onUpdated.addListener(onUpdated);
+                    }
+                    chrome.tabs.onCreated.addListener(onCreated);
                 });
+            });
+
+            const pdfUrl   = pdfTab.url;
+            const pdfTabId = pdfTab.id;
+            console.log(`[bridge] PDF tab: ${pdfUrl}`);
+
+            // Download via fetch with credentials (session cookies)
+            let base64;
+            try {
+                const response = await fetch(pdfUrl, { credentials: 'include' });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const buffer = await response.arrayBuffer();
+                const bytes  = new Uint8Array(buffer);
+                const chunk  = 8192;
+                let binary   = '';
+                for (let i = 0; i < bytes.length; i += chunk) {
+                    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+                }
+                base64 = btoa(binary);
+                console.log(`[bridge] downloaded ${bytes.length} bytes`);
+            } catch (fetchErr) {
+                console.warn(`[bridge] fetch failed (${fetchErr.message}) — trying CDP`);
+                // Fallback: attach debugger to PDF tab and get response body
+                try {
+                    await chrome.debugger.attach({ tabId: pdfTabId }, '1.3');
+                    await chrome.debugger.sendCommand({ tabId: pdfTabId }, 'Network.enable', {});
+                    // The page already loaded — try to get cached response
+                    const result = await chrome.debugger.sendCommand({ tabId: pdfTabId }, 'Runtime.evaluate', {
+                        expression: `fetch(location.href,{credentials:'include'}).then(r=>r.arrayBuffer()).then(b=>{var u=new Uint8Array(b),s='',c=8192;for(var i=0;i<u.length;i+=c)s+=String.fromCharCode(...u.subarray(i,i+c));return btoa(s)})`,
+                        awaitPromise: true,
+                        returnByValue: true,
+                    });
+                    base64 = result.result?.value;
+                    await chrome.debugger.detach({ tabId: pdfTabId }).catch(() => {});
+                } catch (cdpErr) {
+                    await chrome.debugger.detach({ tabId: pdfTabId }).catch(() => {});
+                    await chrome.tabs.remove(pdfTabId).catch(() => {});
+                    throw new Error(`PDF download failed: ${fetchErr.message}`);
+                }
             }
 
-            const pdfUrl = pdfTab.url;
-            console.log(`[bridge] downloading from tab: ${pdfUrl}`);
-
-            // Close the PDF tab
-            await chrome.tabs.remove(pdfTab.id).catch(() => {});
-
-            // Download using extension fetch (has session cookies)
-            const response = await fetch(pdfUrl);
-            if (!response.ok) throw new Error(`Download failed: ${response.status} ${pdfUrl}`);
-
-            const buffer = await response.arrayBuffer();
-            // Convert to base64 in chunks to avoid call stack overflow on large files
-            const bytes   = new Uint8Array(buffer);
-            const chunkSize = 8192;
-            let binary = '';
-            for (let i = 0; i < bytes.length; i += chunkSize) {
-                binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-            }
-            const base64 = btoa(binary);
-
-            return { ok: true, base64, url: pdfUrl, savePath: params.savePath };
+            await chrome.tabs.remove(pdfTabId).catch(() => {});
+            return { ok: true, base64, url: pdfUrl };
         }
 
         case 'catchpdf': {
@@ -395,6 +608,22 @@ async function executeCommand(tabId, cmd, jobId) {
             return { ok: true };
         }
 
+        case 'closeExtraTabs': {
+            // Close any tabs that opened after our bot tab (unexpected popups)
+            const allTabs = await chrome.tabs.query({});
+            const extras  = allTabs.filter(t =>
+                t.id !== tabId &&
+                t.id > tabId && // opened after our tab
+                !t.url?.startsWith('chrome-extension://') &&
+                !t.url?.startsWith('chrome://')
+            );
+            for (const t of extras) {
+                await chrome.tabs.remove(t.id).catch(() => {});
+                console.log(`[bridge] closed extra tab: ${t.id} ${t.url}`);
+            }
+            return { ok: true, closed: extras.length };
+        }
+
         case 'closeTab': {
             try { await chrome.debugger.detach({ tabId }); } catch {}
             await chrome.tabs.remove(tabId).catch(() => {});
@@ -443,8 +672,9 @@ async function startPolling() {
 
     pollInterval = setInterval(async () => {
         try {
-            const cfg  = await getConfig();
-            const res  = await fetch(`${cfg.apiUrl}/jobs`, {
+            const cfg      = await getConfig();
+            const uuid = await getClientId();
+            const res  = await fetch(`${cfg.apiUrl}/jobs?uuid=${uuid}`, {
                 headers: { 'Authorization': `Bearer ${cfg.apiSecret}` },
             });
             if (!res.ok) return;
@@ -456,7 +686,8 @@ async function startPolling() {
             for (const job of waitingJobs) {
                 if (autoConnected.has(job.id)) continue;
                 if (activeBridges.has(job.id)) continue;
-                if (manuallyDisconnected.has(job.id)) continue; // skip manually disconnected
+                if (manuallyDisconnected.has(job.id)) continue;
+                if (reconnecting.has(job.id)) continue; // mid-navigation reconnect
 
                 console.log(`[poller] auto-connecting job: ${job.id}`);
                 autoConnected.add(job.id);
@@ -492,10 +723,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
         try {
             if (msg.type === 'GET_STATE') {
+                const uuid = await getClientId();
                 sendResponse({
-                    bridges: Array.from(activeBridges.values()).map(b => ({ jobId: b.jobId, tabId: b.tabId })),
-                    polling: pollInterval !== null,
+                    bridges:  Array.from(activeBridges.values()).map(b => ({ jobId: b.jobId, tabId: b.tabId })),
+                    polling:  pollInterval !== null,
+                    uuid,
                 });
+
+            } else if (msg.type === 'GET_UUID') {
+                const uuid = await getClientId();
+                sendResponse({ uuid });
+
+            } else if (msg.type === 'RESET_UUID') {
+                const uuid = await resetClientId();
+                sendResponse({ uuid });
 
             } else if (msg.type === 'START_BRIDGE') {
                 await startBridge(msg.jobId);
@@ -577,7 +818,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
 });
 
-// ── Boot ──────────────────────────────────────────────────────────────────────
 startPolling();
 
 // ── Open side panel on icon click ────────────────────────────────────────────

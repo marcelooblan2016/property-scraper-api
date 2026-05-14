@@ -10,6 +10,7 @@ let activeTab        = 0;
 let debuggerAttached = true;
 let logSockets       = {}; // jobId → WebSocket
 let logBuffers       = {}; // jobId → string[]
+let historyLoaded    = {}; // jobId → bool — prevents re-fetching on every render
 const MAX_LOG_LINES  = 150;
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -79,7 +80,19 @@ function setPill(pill, txt, state, label) {
 }
 
 // ── Log WebSocket ─────────────────────────────────────────────────────────────
-async function connectLogSocket(jobId) {
+async function connectLogSocket(jobId, jobStatus) {
+    const isDone = ['completed', 'failed'].includes(jobStatus);
+
+    // Load history once if buffer is empty and not already loading
+    if (!logBuffers[jobId]?.length && !historyLoaded[jobId]) {
+        historyLoaded[jobId] = true; // mark immediately to prevent parallel fetches
+        await fetchLogHistory(jobId);
+    }
+
+    // For completed/failed jobs — no WS needed
+    if (isDone) return;
+
+    // Already connected
     if (logSockets[jobId]?.readyState === WebSocket.OPEN) return;
 
     const data      = await chrome.storage.local.get(['apiUrl', 'apiSecret']);
@@ -101,21 +114,44 @@ async function connectLogSocket(jobId) {
             if (!line) return;
             if (!logBuffers[jobId]) logBuffers[jobId] = [];
             logBuffers[jobId].push(line);
-            if (logBuffers[jobId].length > MAX_LOG_LINES) {
-                logBuffers[jobId].shift();
-            }
-            // Update UI if this job is active tab
+            if (logBuffers[jobId].length > MAX_LOG_LINES) logBuffers[jobId].shift();
             renderLogIfActive(jobId);
         } catch {}
     };
 
     ws.onclose = () => {
         delete logSockets[jobId];
+        // Fetch history so logs persist after job completes
+        if (!historyLoaded[jobId] || logBuffers[jobId]?.length === 0) {
+            historyLoaded[jobId] = false; // allow one more fetch
+            fetchLogHistory(jobId);
+        }
     };
 
     ws.onerror = () => {
         delete logSockets[jobId];
     };
+}
+
+async function fetchLogHistory(jobId) {
+    try {
+        const data      = await chrome.storage.local.get(['apiUrl', 'apiSecret']);
+        const apiUrl    = data.apiUrl    || 'http://localhost:4000';
+        const apiSecret = data.apiSecret || '';
+        const res = await fetch(`${apiUrl}/jobs/${jobId}/logs`, {
+            headers: { 'Authorization': `Bearer ${apiSecret}` },
+        });
+        if (!res.ok) return;
+        const json  = await res.json();
+        const lines = Array.isArray(json) ? json : (json.lines || []);
+        if (!lines.length) return;
+        logBuffers[jobId] = lines.map(l => ({
+            time:  new Date(l.timestamp || Date.now()).toLocaleTimeString('en-US', { hour12: false }),
+            level: (l.type || 'INFO').toUpperCase(),
+            text:  l.message || '',
+        })).filter(l => l.text);
+        renderLogIfActive(jobId);
+    } catch {}
 }
 
 function formatLogLine(msg) {
@@ -228,7 +264,8 @@ async function refreshJobs() {
     }
 
     try {
-        const res  = await fetch(`${apiUrl}/jobs`, { headers: { 'Authorization': `Bearer ${apiSecret}` } });
+        const uuid = await new Promise(resolve => chrome.storage.local.get('uuid', d => resolve(d.uuid || '')));
+        const res  = await fetch(`${apiUrl}/jobs?uuid=${uuid}`, { headers: { 'Authorization': `Bearer ${apiSecret}` } });
         const jobs = await res.json();
         const state = await new Promise(resolve => chrome.runtime.sendMessage({ type: 'GET_STATE' }, resolve));
         const activeBridgeIds = new Set((state?.bridges || []).map(b => b.jobId));
@@ -241,7 +278,7 @@ async function refreshJobs() {
         for (const job of activeJobs) {
             if (!logSockets[job.id]) {
                 logBuffers[job.id] = logBuffers[job.id] || [];
-                connectLogSocket(job.id);
+                connectLogSocket(job.id, job.status);
             }
         }
 
@@ -446,6 +483,7 @@ async function closeTab(jobId) {
 
     // Remove from local log buffer
     delete logBuffers[jobId];
+    delete historyLoaded[jobId];
     disconnectLogSocket(jobId);
 
     showToast('Job dismissed');
@@ -549,6 +587,20 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     document.getElementById('settingsGear')?.addEventListener('click', () => {
         document.getElementById('settingsDrawer')?.classList.toggle('open');
+    });
+
+    document.getElementById('resetUuidBtn')?.addEventListener('click', () => {
+        chrome.runtime.sendMessage({ type: 'RESET_UUID' }, (res) => {
+            const el = document.getElementById('uuidDisplay');
+            if (el) el.textContent = res?.uuid || '—';
+            showToast('Browser ID reset ✓');
+        });
+    });
+
+    // Show uuid in settings drawer
+    chrome.runtime.sendMessage({ type: 'GET_UUID' }, (res) => {
+        const el = document.getElementById('uuidDisplay');
+        if (el) el.textContent = res?.uuid || '—';
     });
 
     loadSettings();

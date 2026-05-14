@@ -19,9 +19,17 @@
 
 'use strict';
 
-// ── Signal extension is present ───────────────────────────────────────────────
+// ── Signal extension is present + expose UUID ─────────────────────────────────
 document.documentElement.setAttribute('data-sam-scraper', 'true');
 document.documentElement.setAttribute('data-sam-scraper-version', '1.0.0');
+
+// Expose UUID so the page can read it without postMessage
+chrome.storage.local.get(['uuid', 'clientId'], (data) => {
+    const uuid = data.uuid || data.clientId || null;
+    if (uuid) {
+        document.documentElement.setAttribute('data-sam-scraper-uuid', uuid);
+    }
+});
 
 // ── Single message listener — routes by namespaced type ──────────────────────
 window.addEventListener('message', async (event) => {
@@ -40,11 +48,15 @@ window.addEventListener('message', async (event) => {
 
         // ── Check if extension is configured ─────────────────────────────────
         case 'SAM_SCRAPER:CHECK': {
+            const uuid = await new Promise(resolve =>
+                chrome.storage.local.get('uuid', d => resolve(d.uuid || null))
+            );
             window.postMessage({
                 type:       'SAM_SCRAPER:CHECK_RESPONSE',
                 installed:  true,
                 configured: !!(apiUrl && apiSecret),
                 apiUrl,
+                uuid,
             }, '*');
             break;
         }
@@ -60,6 +72,9 @@ window.addEventListener('message', async (event) => {
                 break;
             }
             try {
+                const uuid = await new Promise(resolve =>
+                    chrome.storage.local.get('uuid', d => resolve(d.uuid || null))
+                );
                 const res  = await fetch(`${apiUrl}/jobs`, {
                     method:  'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiSecret}` },
@@ -67,6 +82,7 @@ window.addEventListener('message', async (event) => {
                         scraper:    payload.scraper || 'human',
                         query:      payload.query,
                         webhookUrl: payload.webhookUrl || null,
+                        uuid,
                     }),
                 });
                 const json = await res.json();
@@ -92,7 +108,10 @@ window.addEventListener('message', async (event) => {
                 break;
             }
             try {
-                const res  = await fetch(`${apiUrl}/jobs`, {
+                const uuid = await new Promise(resolve =>
+                    chrome.storage.local.get('uuid', d => resolve(d.uuid || null))
+                );
+                const res  = await fetch(`${apiUrl}/jobs?uuid=${uuid}`, {
                     headers: { 'Authorization': `Bearer ${apiSecret}` },
                 });
                 const jobs = await res.json();

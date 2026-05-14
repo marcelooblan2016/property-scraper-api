@@ -41,9 +41,27 @@ app.use(auth);
 app.use('/jobs', jobRoutes);
 
 // ── start ─────────────────────────────────────────────────────────────────────
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
     console.log(`[server] listening on port ${PORT}`);
     console.log(`[server] auth: ${process.env.NODE_API_SECRET ? 'enabled' : 'disabled'}`);
     logServer.attach(httpServer);
     cdpBridge.start();
+
+    // Clean up legacy jobs with no uuid — they're from before UUID isolation
+    try {
+        const { redis } = require('./store/jobStore');
+        const ids = await redis.smembers('jobs:index');
+        let removed = 0;
+        for (const id of ids) {
+            const raw = await redis.hgetall(`job:${id}`);
+            if (!raw || !raw.uuid || raw.uuid === '__null__') {
+                await redis.srem('jobs:index', id);
+                await redis.del(`job:${id}`);
+                removed++;
+            }
+        }
+        if (removed > 0) console.log(`[server] cleaned up ${removed} legacy jobs with no uuid`);
+    } catch (err) {
+        console.warn('[server] cleanup error:', err.message);
+    }
 });

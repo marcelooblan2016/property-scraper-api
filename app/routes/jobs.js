@@ -13,7 +13,7 @@
  */
 
 const { Router }      = require('express');
-const { v4: uuid }    = require('uuid');
+const { v4: uuidv4 }    = require('uuid');
 const EventEmitter    = require('events');
 const fs              = require('fs');
 const path            = require('path');
@@ -26,14 +26,14 @@ const router = Router();
 
 // ── POST /jobs ────────────────────────────────────────────────────────────────
 router.post('/', async (req, res) => {
-    const { scraper = 'bot', query = {}, webhookUrl = null } = req.body;
+    const { scraper = 'bot', query = {}, webhookUrl = null, uuid = null } = req.body;
 
     if (!['bot', 'human'].includes(scraper)) {
         return res.status(400).json({ error: 'scraper must be "bot" or "human"' });
     }
 
     const job = await createJob({
-        id:            uuid(),
+        id:            uuidv4(),
         scraper,
         status:        'queued',
         liveViewUrl:   null,
@@ -41,6 +41,7 @@ router.post('/', async (req, res) => {
         webhookUrl,
         propertyId:    query.propertyId || null,
         query:         query,
+        uuid:      uuid || null,
         result:        null,
         error:         null,
         createdAt:     new Date(),
@@ -85,7 +86,10 @@ router.delete('/', async (req, res) => {
     return res.json({ ok: true, cleared: jobs.length });
 });
 router.get('/', async (req, res) => {
-    const jobs = await listJobs();
+    const uuid = req.query.uuid || req.query.clientId || null;
+    let jobs = await listJobs();
+    // uuid=null jobs are unclaimed — show to all extensions so they can claim them
+    if (uuid) jobs = jobs.filter(j => !j.uuid || j.uuid === uuid);
     return res.json(jobs.map(serializeJob));
 });
 
@@ -207,8 +211,9 @@ router.post('/:id/bridge-ready', async (req, res) => {
     const job = await getJob(req.params.id);
     if (!job) return res.status(404).json({ error: 'Job not found' });
 
-    const { tabId, bridgePort } = req.body;
+    const { tabId, bridgePort, uuid } = req.body;
     console.log(`[bridge-ready] job: ${req.params.id} | tabId: ${tabId}`);
+    if (uuid) await updateJob(req.params.id, { uuid });
 
     const cdpBridge = require('../functions/cdpBridge');
     cdpBridge.signalReady(req.params.id, { tabId, bridgePort });
