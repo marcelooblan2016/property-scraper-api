@@ -28,9 +28,10 @@ const { uploadToS3 } = require('../../helpers/s3Uploader.js');
 
 class ExtensionScraper {
 
-    constructor({ query, jobId, onHandoff, onComplete, onError, onStatusUpdate, logger }) {
+    constructor({ query, jobId, uuid, onHandoff, onComplete, onError, onStatusUpdate, logger }) {
         this.query          = query;
         this.jobId          = jobId;
+        this.uuid           = uuid || null;
         this.onHandoff      = onHandoff      || (async () => {});
         this.onComplete     = onComplete     || (async () => {});
         this.onError        = onError        || (async () => {});
@@ -110,6 +111,7 @@ class ExtensionScraper {
             const line = String(raw).trim();
             if (!line || line.startsWith('#')) continue;
 
+            // ── [if condition] ────────────────────────────────────────────────
             const ifMatch = line.match(/^\[if\s+(.+)\]$/i);
             if (ifMatch) {
                 const condition = ifMatch[1].trim();
@@ -117,24 +119,52 @@ class ExtensionScraper {
                 try {
                     result = new Function('query', `return !!(${condition})`)(this.query);
                 } catch (e) { console.warn('[conditional] eval error:', e.message); }
-                conditionStack.push({ met: result, inElse: false });
-                conditionActive = conditionStack.every(c => c.inElse ? !c.met : c.met);
+                conditionStack.push({ met: result, inElse: false, elseMet: result });
+                conditionActive = conditionStack.every(c => c.inElse ? !c.elseMet : c.met);
                 continue;
             }
 
-            if (line.match(/^\[else\]$/i)) {
+            // ── [elseif condition] ────────────────────────────────────────────
+            const elseifMatch = line.match(/^\[elseif\s+(.+)\]$/i);
+            if (elseifMatch) {
                 if (conditionStack.length > 0) {
-                    conditionStack[conditionStack.length - 1].inElse = true;
-                    conditionActive = conditionStack.every(c => c.inElse ? !c.met : c.met);
+                    const top = conditionStack[conditionStack.length - 1];
+                    // Only evaluate if no previous branch was taken
+                    if (!top.elseMet) {
+                        const condition = elseifMatch[1].trim();
+                        let result = false;
+                        try {
+                            result = new Function('query', `return !!(${condition})`)(this.query);
+                        } catch (e) { console.warn('[conditional] elseif eval error:', e.message); }
+                        top.met      = result;
+                        top.inElse   = true;
+                        top.elseMet  = result;
+                    } else {
+                        top.met    = false;
+                        top.inElse = true;
+                    }
+                    conditionActive = conditionStack.every(c => c.inElse ? c.met : c.met);
                 }
                 continue;
             }
 
+            // ── [else] ────────────────────────────────────────────────────────
+            if (line.match(/^\[else\]$/i)) {
+                if (conditionStack.length > 0) {
+                    const top = conditionStack[conditionStack.length - 1];
+                    top.met    = !top.elseMet; // only true if no branch was taken yet
+                    top.inElse = true;
+                    conditionActive = conditionStack.every(c => c.met);
+                }
+                continue;
+            }
+
+            // ── [endif] ───────────────────────────────────────────────────────
             if (line.match(/^\[endif\]$/i)) {
                 conditionStack.pop();
                 conditionActive = conditionStack.length === 0
                     ? true
-                    : conditionStack.every(c => c.inElse ? !c.met : c.met);
+                    : conditionStack.every(c => c.met);
                 continue;
             }
 
@@ -175,26 +205,30 @@ class ExtensionScraper {
                 // Stop MD execution and hand off to human
                 this.logger?.handoff(`Action failed — human takeover needed: ${err.message}`);
                 await this.cmd('notifyHandoff', { message: `Action failed on: [${t}][${v}] — ${err.message}` }).catch(() => {});
+                await this.cmd('injectBanner', { title: 'Action Required', message: `Action failed: ${err.message}`, type: 'handoff' }).catch(() => {});
                 await this.onHandoff({ message: `Action failed on: [${t}][${v}] ${payload} — ${err.message}. Please complete manually then click Resume.` });
                 // Continue from next action after resume
             }
         }
 
         // Check if file downloaded
-        const propertyId = _.get(this.query, 'propertyId', null);
-        const filePath   = `./downloads/${propertyId}/deed.pdf`;
+        const propertyId  = _.get(this.query, 'propertyId', null);
+        const formattedId = propertyId ? `79-${propertyId}-47` : 'Unknown';
+        const filePath    = `./downloads/${propertyId}/deed.pdf`;
         if (fs.existsSync(filePath)) {
             try {
                 const { s3Key, s3Url } = await uploadToS3({ localPath: filePath, propertyId });
+                await this.cmd('injectBanner', { title: 'Job Completed', message: `${formattedId} — deed PDF uploaded successfully.`, type: 'complete' }).catch(() => {});
                 await this.onComplete({ filePath, s3Key, s3Url });
             } catch {
+                await this.cmd('injectBanner', { title: 'Job Completed (S3 failed)', message: `${formattedId} — PDF downloaded but S3 upload failed.`, type: 'warning' }).catch(() => {});
                 await this.onComplete({ filePath, s3Key: null, s3Url: null });
             }
         } else {
+            await this.cmd('injectBanner', { title: 'Job Finished — No File', message: `${formattedId} — completed but no PDF was downloaded.`, type: 'warning' }).catch(() => {});
             await this.onComplete({ filePath: null, s3Key: null, s3Url: null });
         }
 
-        // Tab stays open — user closes manually via extension popup
         this.logger?.info('Job finished — close the tab manually from the extension when ready.');
     }
 
@@ -315,6 +349,7 @@ class ExtensionScraper {
                 if (captcha) {
                     this.logger?.handoff(`CAPTCHA detected — human takeover needed`);
                     await this.cmd('notifyHandoff', { message: `CAPTCHA detected. Please solve it and click Resume to continue.` }).catch(() => {});
+                    await this.cmd('injectBanner', { title: 'CAPTCHA Detected!', message: 'Please solve the CAPTCHA and click Resume.', type: 'captcha' }).catch(() => {});
                     await this.onHandoff({ message: `CAPTCHA detected. Please solve it and click Resume to continue.` });
                     this._captchaCooldownUntil = Date.now() + 30000;
                 } else {
@@ -352,6 +387,7 @@ class ExtensionScraper {
             if (verb === 'handoff') {
                 // Notify extension to show "Go to Tab" button — no auto-focus
                 await this.cmd('notifyHandoff', { message: payload }).catch(() => {});
+                await this.cmd('injectBanner', { title: 'Action Required', message: payload, type: 'handoff' }).catch(() => {});
                 await this.onHandoff({ message: payload });
                 return;
             }
@@ -372,6 +408,8 @@ class ExtensionScraper {
         if (target === 'human') {
             if (verb === 'pause') {
                 this.logger?.handoff(`Paused: ${payload}`);
+                await this.cmd('notifyHandoff', { message: payload || 'Human action required — click Resume to continue.' }).catch(() => {});
+                await this.cmd('injectBanner', { title: 'Action Required', message: payload || 'Human action required — click Resume.', type: 'handoff' }).catch(() => {});
                 await this.onHandoff({ message: payload });
                 return;
             }
@@ -452,6 +490,7 @@ ${html.slice(0, 5000)}`,
         }
     }
 
+    // ── Send Web Push notification ────────────────────────────────────────────
     // ── Wait for page to be fully ready ──────────────────────────────────────
     async _waitForPageReady(timeoutMs = 8000) {
         // Record current tab count to detect unexpected new tabs

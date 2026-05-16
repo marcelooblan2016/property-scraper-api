@@ -522,7 +522,7 @@ class PropertyScraperHuman {
             this.query.apn = this.query.apn.replace(/^["']|["']$/g, '');
         }
 
-        // ── conditional pre-pass (identical to type1) ─────────────────────────
+        // ── conditional pre-pass ──────────────────────────────────────────────
         const resolvedActions = [];
         const conditionStack  = [];
         let conditionActive   = true;
@@ -531,27 +531,56 @@ class PropertyScraperHuman {
             const line = String(raw).trim();
             if (!line || line.startsWith('#')) continue;
 
+            // ── [if condition] ────────────────────────────────────────────────
             const ifMatch = line.match(/^\[if\s+(.+)\]$/i);
             if (ifMatch) {
                 let result = false;
                 try { result = new Function('query', `return !!(${ifMatch[1].trim()})`)(this.query); }
                 catch (e) { console.warn('[conditional] eval error:', e.message); }
-                conditionStack.push({ met: result, inElse: false });
-                conditionActive = conditionStack.every(c => c.inElse ? !c.met : c.met);
+                conditionStack.push({ met: result, inElse: false, elseMet: result });
+                conditionActive = conditionStack.every(c => c.met);
                 continue;
             }
-            if (line.match(/^\[else\]$/i)) {
+
+            // ── [elseif condition] ────────────────────────────────────────────
+            const elseifMatch = line.match(/^\[elseif\s+(.+)\]$/i);
+            if (elseifMatch) {
                 if (conditionStack.length) {
-                    conditionStack[conditionStack.length - 1].inElse = true;
-                    conditionActive = conditionStack.every(c => c.inElse ? !c.met : c.met);
+                    const top = conditionStack[conditionStack.length - 1];
+                    if (!top.elseMet) {
+                        let result = false;
+                        try { result = new Function('query', `return !!(${elseifMatch[1].trim()})`)(this.query); }
+                        catch (e) { console.warn('[conditional] elseif eval error:', e.message); }
+                        top.met     = result;
+                        top.inElse  = true;
+                        top.elseMet = result;
+                    } else {
+                        top.met    = false;
+                        top.inElse = true;
+                    }
+                    conditionActive = conditionStack.every(c => c.met);
                 }
                 continue;
             }
-            if (line.match(/^\[endif\]$/i)) {
-                conditionStack.pop();
-                conditionActive = !conditionStack.length || conditionStack.every(c => c.inElse ? !c.met : c.met);
+
+            // ── [else] ────────────────────────────────────────────────────────
+            if (line.match(/^\[else\]$/i)) {
+                if (conditionStack.length) {
+                    const top  = conditionStack[conditionStack.length - 1];
+                    top.met    = !top.elseMet;
+                    top.inElse = true;
+                    conditionActive = conditionStack.every(c => c.met);
+                }
                 continue;
             }
+
+            // ── [endif] ───────────────────────────────────────────────────────
+            if (line.match(/^\[endif\]$/i)) {
+                conditionStack.pop();
+                conditionActive = !conditionStack.length || conditionStack.every(c => c.met);
+                continue;
+            }
+
             if (conditionActive) resolvedActions.push(raw);
         }
 

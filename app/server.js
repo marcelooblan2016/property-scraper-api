@@ -19,8 +19,8 @@ dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const auth      = require('./middleware/auth');
 const jobRoutes = require('./routes/jobs');
-const logServer = require('./functions/logServer');
-const cdpBridge = require('./functions/cdpBridge');
+const logServer    = require('./functions/logServer');
+const cdpBridge    = require('./functions/cdpBridge');
 
 const app        = express();
 const httpServer = http.createServer(app);

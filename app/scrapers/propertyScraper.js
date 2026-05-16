@@ -292,35 +292,54 @@ class PropertyScraper {
             const line = String(raw).trim();
             if (!line) continue;
 
+            // ── [if condition] ────────────────────────────────────────────────
             const ifMatch = line.match(/^\[if\s+(.+)\]$/i);
             if (ifMatch) {
                 const condition = ifMatch[1].trim();
                 let result = false;
-                try {
-                    const evalFn = new Function('query', `return !!(${condition})`);
-                    result = evalFn(this.query);
-                } catch (e) {
-                    console.warn('[conditional] eval error:', e.message);
-                }
-                conditionStack.push({ met: result, inElse: false });
-                conditionActive = conditionStack.every(c => c.inElse ? !c.met : c.met);
-                console.log(`[conditional] [if ${condition}] => ${result}, active: ${conditionActive}`);
+                try { result = new Function('query', `return !!(${condition})`)(this.query); }
+                catch (e) { console.warn('[conditional] eval error:', e.message); }
+                conditionStack.push({ met: result, inElse: false, elseMet: result });
+                conditionActive = conditionStack.every(c => c.met);
                 continue;
             }
 
+            // ── [elseif condition] ────────────────────────────────────────────
+            const elseifMatch = line.match(/^\[elseif\s+(.+)\]$/i);
+            if (elseifMatch) {
+                if (conditionStack.length > 0) {
+                    const top = conditionStack[conditionStack.length - 1];
+                    if (!top.elseMet) {
+                        let result = false;
+                        try { result = new Function('query', `return !!(${elseifMatch[1].trim()})`)(this.query); }
+                        catch (e) { console.warn('[conditional] elseif eval error:', e.message); }
+                        top.met     = result;
+                        top.inElse  = true;
+                        top.elseMet = result;
+                    } else {
+                        top.met    = false;
+                        top.inElse = true;
+                    }
+                    conditionActive = conditionStack.every(c => c.met);
+                }
+                continue;
+            }
+
+            // ── [else] ────────────────────────────────────────────────────────
             if (line.match(/^\[else\]$/i)) {
                 if (conditionStack.length > 0) {
-                    conditionStack[conditionStack.length - 1].inElse = true;
-                    conditionActive = conditionStack.every(c => c.inElse ? !c.met : c.met);
-                    console.log(`[conditional] [else] active: ${conditionActive}`);
+                    const top  = conditionStack[conditionStack.length - 1];
+                    top.met    = !top.elseMet;
+                    top.inElse = true;
+                    conditionActive = conditionStack.every(c => c.met);
                 }
                 continue;
             }
 
+            // ── [endif] ───────────────────────────────────────────────────────
             if (line.match(/^\[endif\]$/i)) {
                 conditionStack.pop();
-                conditionActive = conditionStack.length === 0 || conditionStack.every(c => c.inElse ? !c.met : c.met);
-                console.log(`[conditional] [endif] active: ${conditionActive}`);
+                conditionActive = conditionStack.length === 0 || conditionStack.every(c => c.met);
                 continue;
             }
 

@@ -145,7 +145,7 @@ async function runScraper(job, query) {
     };
 
     // ── run ───────────────────────────────────────────────────────────────────
-    const instance = new ScraperClass({ query, standalone: false, logger, jobId: job.id, ...callbacks });
+    const instance = new ScraperClass({ query, standalone: false, logger, jobId: job.id, uuid: job.uuid, ...callbacks });
     try {
         await instance.startNow();
     } finally {
@@ -157,6 +157,16 @@ async function runScraper(job, query) {
             // Scraper exited without setting a terminal status — mark as failed
             await updateJob(job.id, { status: 'failed', error: 'Scraper exited unexpectedly' });
             logger.error('Scraper exited unexpectedly');
+            try {
+                const pushNotifier = require('./pushNotifier');
+                const propertyId   = job.query?.propertyId || job.id.slice(0, 8);
+                await pushNotifier.sendNotification(job.uuid, {
+                    title:   '⚠️ Job Stopped Unexpectedly',
+                    message: `Property ${propertyId} — scraper exited without completing.`,
+                    jobId:   job.id,
+                    type:    'error',
+                });
+            } catch {}
         }
 
         if (job.scraper === 'human') {

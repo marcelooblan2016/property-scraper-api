@@ -13,6 +13,48 @@ let logBuffers       = {}; // jobId → string[]
 let historyLoaded    = {}; // jobId → bool — prevents re-fetching on every render
 const MAX_LOG_LINES  = 150;
 
+function updateNotifBanner(permission) {
+    const existing = document.getElementById('notifBanner');
+    if (permission === 'granted') {
+        existing?.remove();
+        return;
+    }
+    if (existing) return; // already showing
+
+    const banner = document.createElement('div');
+    banner.id = 'notifBanner';
+    banner.style.cssText = `
+        background: ${permission === 'denied' ? '#fee2e2' : '#fef9c3'};
+        border-bottom: 1px solid ${permission === 'denied' ? '#fca5a5' : '#fde68a'};
+        padding: 10px 16px;
+        font-size: 11px;
+        color: ${permission === 'denied' ? '#991b1b' : '#92400e'};
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+    `;
+
+    if (permission === 'denied') {
+        banner.innerHTML = `
+            <span>🔕 Notifications blocked — you won't be alerted for CAPTCHA or handoffs.</span>
+            <a href="chrome://settings/content/notifications" style="color:inherit;font-weight:600;white-space:nowrap;text-decoration:underline;" target="_blank">Fix</a>
+        `;
+    } else {
+        banner.innerHTML = `
+            <span>🔔 Allow notifications to get CAPTCHA alerts</span>
+            <button id="notifAllowBtn" style="font-size:11px;padding:3px 10px;border:1px solid #d97706;border-radius:4px;background:#fff;cursor:pointer;color:#92400e;white-space:nowrap;">Allow</button>
+        `;
+        banner.querySelector('#notifAllowBtn')?.addEventListener('click', () => {
+            Notification.requestPermission().then(p => updateNotifBanner(p));
+        });
+    }
+
+    // Insert after header
+    const header = document.querySelector('.header');
+    header?.insertAdjacentElement('afterend', banner);
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 async function loadSettings() {
     const data = await chrome.storage.local.get(['apiUrl', 'apiSecret', 'bridgePort']);
@@ -577,6 +619,14 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+    // Request notification permission if not granted
+    if (Notification.permission === 'default') {
+        Notification.requestPermission().then(permission => {
+            updateNotifBanner(permission);
+        });
+    } else {
+        updateNotifBanner(Notification.permission);
+    }
     document.getElementById('saveBtn')?.addEventListener('click', saveSettings);
     document.getElementById('refreshBtn')?.addEventListener('click', refreshJobs);
     document.getElementById('debuggerToggleBtn')?.addEventListener('click', toggleDebugger);

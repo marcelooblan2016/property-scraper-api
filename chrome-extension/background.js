@@ -592,19 +592,71 @@ async function executeCommand(tabId, cmd, jobId) {
             return { ok: true, base64: pdfBase64 };
         }
 
+        case 'injectBanner': {
+            const { title, message, type } = params;
+            const isCaptcha  = type === 'captcha';
+            const isComplete = type === 'complete';
+            const bgColor    = isCaptcha ? '#dc2626' : isComplete ? '#16a34a' : '#d97706';
+            const icon       = isCaptcha ? '🤖' : isComplete ? '✅' : '⏸';
+            const pulse      = isCaptcha ? 'animation:__sam-pulse 1.2s ease-in-out infinite;' : '';
+
+            // Inject into all active tabs
+            const tabs = await chrome.tabs.query({ active: true });
+            for (const t of tabs) {
+                if (t.url?.startsWith('chrome://') || t.url?.startsWith('chrome-extension://')) continue;
+                chrome.scripting.executeScript({
+                    target: { tabId: t.id },
+                    func: (title, message, bgColor, icon, pulse) => {
+                        document.getElementById('__sam-scraper-banner')?.remove();
+                        const banner = document.createElement('div');
+                        banner.id = '__sam-scraper-banner';
+                        banner.style.cssText = `
+                            position:fixed;top:16px;right:16px;z-index:2147483647;
+                            background:${bgColor};color:#fff;
+                            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+                            font-size:13px;font-weight:600;
+                            padding:12px 16px;border-radius:10px;
+                            box-shadow:0 4px 24px rgba(0,0,0,0.3);
+                            max-width:320px;cursor:pointer;
+                            animation:__sam-slidein 0.3s ease;${pulse}
+                        `;
+                        banner.innerHTML = `
+                            <style>
+                                @keyframes __sam-slidein{from{opacity:0;transform:translateY(-12px)}to{opacity:1;transform:translateY(0)}}
+                                @keyframes __sam-pulse{0%,100%{opacity:1}50%{opacity:0.7}}
+                            </style>
+                            <div style="display:flex;align-items:flex-start;gap:8px;">
+                                <span style="font-size:18px;flex-shrink:0;">${icon}</span>
+                                <div style="flex:1;">
+                                    <div style="font-size:11px;opacity:0.85;margin-bottom:2px;">SAM Scraper</div>
+                                    <div>${title}</div>
+                                    <div style="font-size:11px;font-weight:400;margin-top:3px;opacity:0.9;">${message}</div>
+                                </div>
+                                <span style="font-size:16px;opacity:0.7;cursor:pointer;flex-shrink:0;" onclick="this.closest('#__sam-scraper-banner').remove()">✕</span>
+                            </div>
+                        `;
+                        banner.onclick = (e) => { if (e.target.tagName !== 'SPAN') banner.remove(); };
+                        document.body.appendChild(banner);
+                        setTimeout(() => banner.remove(), 30000);
+                    },
+                    args: [title, message, bgColor, icon, pulse],
+                }).catch(() => {});
+            }
+            return { ok: true };
+        }
+
         case 'notifyHandoff': {
-            // Show Chrome notification with "Go to Tab" action
-            // Store the handoff info so popup can show "Go to Tab" button
-            const bridge = activeBridges.get(jobId);
+            const bridge    = activeBridges.get(jobId);
             if (bridge) bridge.pendingHandoff = params.message || 'Action required';
             notifyPopup('HANDOFF_REQUIRED', { jobId, tabId, message: params.message });
-            // Show system notification
-            chrome.notifications.create(`handoff-${jobId}`, {
-                type:    'basic',
-                iconUrl: 'icons/icon48.png',
-                title:   'SAM Scraper — Action Required',
-                message: params.message || 'Please complete the required action',
-            });
+
+            const isCaptcha = (params.message || '').toLowerCase().includes('captcha');
+            const title     = isCaptcha ? 'CAPTCHA Detected!' : 'Action Required';
+            const message   = params.message || 'Please complete the required action';
+            const type      = isCaptcha ? 'captcha' : 'handoff';
+
+            // Reuse injectBanner logic
+            await executeCommand(jobId, tabId, 'injectBanner', { title, message, type });
             return { ok: true };
         }
 
@@ -669,6 +721,9 @@ async function startPolling() {
     const config = await getConfig();
     if (!config.apiSecret) { console.log('[poller] no secret — skipping'); return; }
     console.log(`[poller] started | ${config.apiUrl}`);
+
+    // Subscribe/re-subscribe to push notifications
+    // (removed — using banner injection instead)
 
     pollInterval = setInterval(async () => {
         try {
@@ -821,6 +876,4 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 startPolling();
 
 // ── Open side panel on icon click ────────────────────────────────────────────
-chrome.action.onClicked.addListener((tab) => {
-    chrome.sidePanel.open({ windowId: tab.windowId });
-});
+// Popup opens automatically when extension icon is clicked (defined in manifest)
