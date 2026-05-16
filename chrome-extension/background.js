@@ -316,50 +316,145 @@ async function executeCommand(tabId, cmd, jobId) {
         }
 
         case 'waitDownload': {
-            const timeout = params.timeout || 120000; // 2 min for human to download
+            const timeout   = params.timeout  || 120000;
+            const confirmed = params.confirmed || false;
+            const mins      = Math.round(timeout / 60000);
 
-            const pdfData = await new Promise((resolve, reject) => {
+            // Show instruction banner on bot tab
+            chrome.scripting.executeScript({
+                target: { tabId },
+                func: (mins, confirm) => {
+                    document.getElementById('__sam-scraper-banner')?.remove();
+                    const b = document.createElement('div');
+                    b.id = '__sam-scraper-banner';
+                    b.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647;background:#1e40af;color:#fff;font-family:-apple-system,sans-serif;font-size:13px;font-weight:600;padding:12px 16px;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,0.3);max-width:320px;';
+                    b.innerHTML = `<div style="font-size:11px;opacity:0.8;margin-bottom:2px;">SAM Scraper</div><div>🔍 Select the correct deed PDF</div><div style="font-size:11px;font-weight:400;margin-top:4px;opacity:0.9;">Click <b>View Image</b> on the correct record.${confirm ? ' You will be asked to confirm.' : ''} Timeout: ${mins} min.</div>`;
+                    b.onclick = () => b.remove();
+                    document.body.appendChild(b);
+                    setTimeout(() => b.remove(), mins * 60 * 1000);
+                },
+                args: [mins, confirmed],
+            }).catch(() => {});
+
+            // Intercept PDF via Page.navigatedWithinDocument or new tab navigation
+            // Strategy: watch for window.open / target=new clicks via CDP
+            // and capture the URL before it opens, then fetch via page context
+            const pdfUrl = await new Promise((resolve, reject) => {
                 const timer = setTimeout(() => {
                     chrome.debugger.onEvent.removeListener(onEvent);
-                    reject(new Error('Wait download timeout — no PDF downloaded within 2 minutes'));
+                    reject(new Error(`Wait download timeout — no PDF captured within ${mins} minutes`));
                 }, timeout);
 
-                const reqIds = new Map(); // requestId → url
+                // Intercept new tab requests via CDP Target events
+                chrome.debugger.sendCommand({ tabId }, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
 
-                function onEvent(source, method, eventParams) {
-                    if (source.tabId !== tabId) return;
-
-                    if (method === 'Network.responseReceived') {
-                        const mime = eventParams.response?.mimeType || '';
-                        const url  = eventParams.response?.url || '';
-                        if (mime.includes('pdf') || url.includes('.pdf') || mime.includes('octet-stream')) {
-                            reqIds.set(eventParams.requestId, url);
+                async function onEvent(source, method, eventParams) {
+                    // Catch window.open / target=_new navigation via Target
+                    if (method === 'Target.targetCreated') {
+                        const info = eventParams.targetInfo;
+                        if (info.type === 'page' && info.url && info.url !== 'about:blank') {
+                            const url = info.url;
+                            if (url.includes('/orisearch/') || url.includes('/image') || url.includes('.pdf')) {
+                                chrome.debugger.onEvent.removeListener(onEvent);
+                                clearTimeout(timer);
+                                // Close the new tab — we'll fetch the PDF ourselves
+                                chrome.tabs.query({}, (tabs) => {
+                                    const newTab = tabs.find(t => t.url === url || t.id.toString() === info.targetId);
+                                    if (newTab) chrome.tabs.remove(newTab.id).catch(() => {});
+                                });
+                                resolve(url);
+                            }
                         }
                     }
 
-                    if (method === 'Network.loadingFinished' && reqIds.has(eventParams.requestId)) {
-                        const url = reqIds.get(eventParams.requestId);
-                        chrome.debugger.sendCommand(
-                            { tabId },
-                            'Network.getResponseBody',
-                            { requestId: eventParams.requestId }
-                        ).then(body => {
+                    // Also catch via Network on bot tab (some sites load PDF in same tab)
+                    if (source.tabId !== tabId) return;
+                    if (method === 'Network.responseReceived') {
+                        const mime = eventParams.response?.mimeType || '';
+                        const url  = eventParams.response?.url     || '';
+                        if (mime.includes('pdf') || mime.includes('octet-stream')) {
                             chrome.debugger.onEvent.removeListener(onEvent);
                             clearTimeout(timer);
-                            resolve({ body, url });
-                        }).catch(() => {});
+                            resolve(url);
+                        }
+                    }
+                    // Catch navigation to image URL
+                    if (method === 'Page.frameNavigated') {
+                        const url = eventParams.frame?.url || '';
+                        if (url.includes('/orisearch/s/image') || url.includes('.pdf')) {
+                            chrome.debugger.onEvent.removeListener(onEvent);
+                            clearTimeout(timer);
+                            resolve(url);
+                        }
                     }
                 }
-
                 chrome.debugger.onEvent.addListener(onEvent);
             });
 
-            const base64 = pdfData.body.base64Encoded
-                ? pdfData.body.body
-                : btoa(pdfData.body.body);
+            console.log(`[bridge] wait-download intercepted URL: ${pdfUrl}`);
 
-            console.log(`[bridge] wait-download caught: ${pdfData.url}`);
-            return { ok: true, base64, url: pdfData.url };
+            if (confirmed) {
+                // Show confirm banner on bot tab
+                chrome.tabs.update(tabId, { active: true }).catch(() => {});
+                await chrome.scripting.executeScript({
+                    target: { tabId },
+                    func: (filename) => {
+                        document.getElementById('__sam-scraper-banner')?.remove();
+                        document.getElementById('__sam-dl-confirm')?.remove();
+                        window.__samDlResult = null;
+                        const b = document.createElement('div');
+                        b.id = '__sam-dl-confirm';
+                        b.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647;background:#1a1a1a;color:#fff;font-family:-apple-system,sans-serif;font-size:13px;padding:14px 18px;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,0.4);max-width:340px;';
+                        b.innerHTML = `<div style="font-size:11px;opacity:0.7;margin-bottom:4px;">SAM Scraper</div><div style="font-weight:600;margin-bottom:4px;">📄 PDF Ready to Download</div><div style="font-size:11px;opacity:0.8;margin-bottom:10px;">${filename}</div><div style="font-size:11px;opacity:0.7;margin-bottom:10px;">Is this the correct deed?</div><div style="display:flex;gap:8px;"><button id="__sam-yes" style="flex:1;padding:7px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">✓ Yes, download</button><button id="__sam-no" style="flex:1;padding:7px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">✗ Try another</button></div>`;
+                        document.body.appendChild(b);
+                        document.getElementById('__sam-yes')?.addEventListener('click', () => { b.remove(); window.__samDlResult = 'yes'; });
+                        document.getElementById('__sam-no')?.addEventListener('click',  () => { b.remove(); window.__samDlResult = 'no';  });
+                    },
+                    args: [pdfUrl.split('/').pop() || 'deed.pdf'],
+                }).catch(() => {});
+
+                const decision = await new Promise(res => {
+                    const poll = setInterval(async () => {
+                        const r = await chrome.scripting.executeScript({
+                            target: { tabId },
+                            func:   () => window.__samDlResult,
+                        }).catch(() => [{ result: null }]);
+                        const val = r?.[0]?.result;
+                        if (val === 'yes') { clearInterval(poll); res('yes'); }
+                        if (val === 'no')  { clearInterval(poll); res('no');  }
+                    }, 500);
+                    setTimeout(() => { clearInterval(poll); res('yes'); }, 300000);
+                });
+
+                if (decision === 'no') {
+                    // Try again — re-run waitDownload recursively
+                    return executeCommand(jobId, tabId, 'waitDownload', params);
+                }
+            }
+
+            // Fetch PDF via page context (uses session cookies, no new tab needed)
+            const res = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+                expression: `(async function(){
+                    const url = new URL(${JSON.stringify(pdfUrl)}, location.href).href;
+                    const r = await fetch(url, { credentials: 'include', headers: { 'Referer': location.href } });
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    const buf = await r.arrayBuffer();
+                    const u   = new Uint8Array(buf);
+                    let b = '';
+                    for (let i = 0; i < u.length; i += 8192)
+                        b += String.fromCharCode(...u.subarray(i, i + 8192));
+                    return JSON.stringify({ base64: btoa(b), size: u.length });
+                })()`,
+                awaitPromise:  true,
+                returnByValue: true,
+            });
+
+            if (res.exceptionDetails) throw new Error(res.exceptionDetails?.exception?.description || 'PDF fetch failed');
+            const parsed = JSON.parse(res.result?.value || '{}');
+            if (!parsed.base64) throw new Error('PDF fetch returned empty');
+
+            console.log(`[bridge] wait-download fetched ${parsed.size} bytes from ${pdfUrl}`);
+            return { ok: true, base64: parsed.base64, url: pdfUrl };
         }
 
         case 'expectNewTab': {
@@ -592,12 +687,183 @@ async function executeCommand(tabId, cmd, jobId) {
             return { ok: true, base64: pdfBase64 };
         }
 
+        case 'showResultsModal': {
+            const { results, columns, label, timeout: modalTimeout } = params;
+
+            const selectedHref = await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    chrome.scripting.executeScript({
+                        target: { tabId },
+                        func: () => document.getElementById('__sam-results-modal')?.remove(),
+                    }).catch(() => {});
+                    reject(new Error('Results modal timeout — no selection made'));
+                }, modalTimeout || 300000);
+
+                chrome.scripting.executeScript({
+                    target: { tabId },
+                    func: (results, columns, label) => {
+                        document.getElementById('__sam-results-modal')?.remove();
+                        window.__samModalResult = null;
+
+                        const overlay = document.createElement('div');
+                        overlay.id = '__sam-results-modal';
+                        overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
+
+                        const modal = document.createElement('div');
+                        modal.style.cssText = 'background:#fff;border-radius:12px;width:min(90vw,800px);max-height:80vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.4);overflow:hidden;';
+
+                        // Header
+                        const header = document.createElement('div');
+                        header.style.cssText = 'background:#1a1a1a;color:#fff;padding:16px 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;';
+                        header.innerHTML = `
+                            <div>
+                                <div style="font-weight:700;font-size:15px;">🔍 Select the Correct Deed</div>
+                                <div style="font-size:11px;opacity:0.7;margin-top:2px;">${label || ''} — ${results.length} result${results.length !== 1 ? 's' : ''} found</div>
+                            </div>
+                            <button id="__sam-modal-close" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;opacity:0.7;padding:4px 8px;line-height:1;">✕</button>
+                        `;
+
+                        // Body
+                        const body = document.createElement('div');
+                        body.style.cssText = 'overflow-y:auto;flex:1;';
+
+                        const table = document.createElement('table');
+                        table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
+
+                        // Build thead from columns config
+                        const thead = document.createElement('thead');
+                        const headerRow = document.createElement('tr');
+                        headerRow.style.cssText = 'background:#f5f5f5;border-bottom:2px solid #e5e5e5;position:sticky;top:0;';
+                        columns.forEach(col => {
+                            const th = document.createElement('th');
+                            th.style.cssText = 'padding:10px 14px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#666;font-weight:600;white-space:nowrap;';
+                            th.textContent = col.label;
+                            headerRow.appendChild(th);
+                        });
+                        const thAction = document.createElement('th');
+                        thAction.style.cssText = 'padding:10px 14px;';
+                        headerRow.appendChild(thAction);
+                        thead.appendChild(headerRow);
+                        table.appendChild(thead);
+
+                        // Build tbody from results
+                        const tbody = document.createElement('tbody');
+                        results.forEach((row) => {
+                            const tr = document.createElement('tr');
+                            tr.style.cssText = 'border-bottom:1px solid #f0f0f0;transition:background 0.1s;';
+                            tr.addEventListener('mouseenter', () => tr.style.background = '#f8f8f8');
+                            tr.addEventListener('mouseleave', () => tr.style.background = '');
+
+                            columns.forEach(col => {
+                                const td = document.createElement('td');
+                                td.style.cssText = `padding:12px 14px;${col.style || ''}`;
+                                const val = row[col.key] || '';
+                                if (col.badge && val) {
+                                    // T = Grantee (blue), F = Grantor (yellow), others = gray
+                                    const colors = val === 'T'
+                                        ? 'background:#dbeafe;color:#1d4ed8;'
+                                        : val === 'F'
+                                            ? 'background:#fef3c7;color:#92400e;'
+                                            : 'background:#f3f4f6;color:#374151;';
+                                    const label2 = val === 'T' ? 'Grantee' : val === 'F' ? 'Grantor' : val;
+                                    td.innerHTML = `<span style="${colors}padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;">${label2}</span>`;
+                                } else {
+                                    td.textContent = val;
+                                }
+                                tr.appendChild(td);
+                            });
+
+                            // Download (preview) + This is the Deed buttons
+                            const tdAction = document.createElement('td');
+                            tdAction.style.cssText = 'padding:10px 14px;text-align:center;white-space:nowrap;';
+
+                            const btnDownload = document.createElement('button');
+                            btnDownload.textContent = 'Download';
+                            btnDownload.style.cssText = 'background:#f3f4f6;color:#374151;border:1px solid #d1d5db;padding:5px 12px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;margin-right:6px;';
+                            btnDownload.addEventListener('mouseenter', () => btnDownload.style.background = '#e5e7eb');
+                            btnDownload.addEventListener('mouseleave', () => btnDownload.style.background = '#f3f4f6');
+                            btnDownload.addEventListener('click', async (e) => {
+                                e.stopPropagation();
+                                btnDownload.textContent = 'Opening…';
+                                btnDownload.disabled = true;
+                                try {
+                                    const pdfUrl = new URL(row.href, location.href).href;
+                                    const res    = await fetch(pdfUrl, { credentials: 'include', headers: { 'Referer': location.href } });
+                                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                                    const blob    = await res.blob();
+                                    const blobUrl = URL.createObjectURL(blob);
+                                    window.open(blobUrl, '_blank');
+                                    // Revoke after short delay
+                                    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+                                } catch (err) {
+                                    alert(`Preview failed: ${err.message}`);
+                                } finally {
+                                    btnDownload.textContent = 'Download';
+                                    btnDownload.disabled = false;
+                                }
+                            });
+
+                            const btnConfirm = document.createElement('button');
+                            btnConfirm.textContent = '✓ This is the Deed';
+                            btnConfirm.style.cssText = 'background:#16a34a;color:#fff;border:none;padding:5px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;';
+                            btnConfirm.addEventListener('mouseenter', () => btnConfirm.style.background = '#15803d');
+                            btnConfirm.addEventListener('mouseleave', () => btnConfirm.style.background = '#16a34a');
+                            btnConfirm.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                document.getElementById('__sam-preview-frame')?.remove();
+                                overlay.remove();
+                                window.__samModalResult = row.href;
+                            });
+
+                            tdAction.appendChild(btnDownload);
+                            tdAction.appendChild(btnConfirm);
+                            tr.appendChild(tdAction);
+                            tbody.appendChild(tr);
+                        });
+
+                        table.appendChild(tbody);
+                        body.appendChild(table);
+                        modal.appendChild(header);
+                        modal.appendChild(body);
+                        overlay.appendChild(modal);
+                        document.body.appendChild(overlay);
+
+                        document.getElementById('__sam-modal-close')?.addEventListener('click', () => {
+                            overlay.remove();
+                            window.__samModalResult = '__cancelled__';
+                        });
+                    },
+                    args: [results, columns || [], label || ''],
+                }).catch(() => {});
+
+                // Poll for selection
+                const poll = setInterval(async () => {
+                    const r = await chrome.scripting.executeScript({
+                        target: { tabId },
+                        func:   () => window.__samModalResult,
+                    }).catch(() => [{ result: null }]);
+                    const val = r?.[0]?.result;
+                    if (val === '__cancelled__') {
+                        clearInterval(poll); clearTimeout(timer);
+                        reject(new Error('Researcher cancelled selection'));
+                    } else if (val) {
+                        clearInterval(poll); clearTimeout(timer);
+                        resolve(val);
+                    }
+                }, 500);
+            });
+
+            return { ok: true, href: selectedHref };
+        }
+
+
         case 'injectBanner': {
             const { title, message, type } = params;
             const isCaptcha  = type === 'captcha';
             const isComplete = type === 'complete';
-            const bgColor    = isCaptcha ? '#dc2626' : isComplete ? '#16a34a' : '#d97706';
-            const icon       = isCaptcha ? '🤖' : isComplete ? '✅' : '⏸';
+            const isStart    = type === 'start';
+            const bgColor    = isCaptcha ? '#dc2626' : isComplete ? '#16a34a' : isStart ? '#1e40af' : '#d97706';
+            const icon       = isCaptcha ? '🤖' : isComplete ? '✅' : isStart ? '🚀' : '⏸';
             const pulse      = isCaptcha ? 'animation:__sam-pulse 1.2s ease-in-out infinite;' : '';
 
             // Inject into all active tabs
@@ -642,6 +908,34 @@ async function executeCommand(tabId, cmd, jobId) {
                     args: [title, message, bgColor, icon, pulse],
                 }).catch(() => {});
             }
+
+            // Fire OS notification for start events
+            if (type === 'start') {
+                const startNotifId = `sam-start-${jobId}`;
+                chrome.notifications.create(startNotifId, {
+                    type:     'basic',
+                    iconUrl:  'icons/icon48.png',
+                    title:    '🚀 SAM Scraper — Started',
+                    message:  message || 'Scraping has begun',
+                    priority: 1,
+                });
+
+                // Click → store jobId and open popup
+                const startHandler = async (clickedId) => {
+                    if (clickedId !== startNotifId) return;
+                    chrome.notifications.onClicked.removeListener(startHandler);
+                    chrome.notifications.clear(startNotifId);
+                    await chrome.storage.local.set({ __samFocusJobId: jobId });
+                    chrome.tabs.update(tabId, { active: true }).catch(() => {});
+                    const tab = await chrome.tabs.get(tabId).catch(() => null);
+                    if (tab?.windowId) chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+                };
+                chrome.notifications.onClicked.addListener(startHandler);
+
+                // Auto-clear after 5s
+                setTimeout(() => chrome.notifications.clear(startNotifId), 5000);
+            }
+
             return { ok: true };
         }
 
@@ -654,9 +948,88 @@ async function executeCommand(tabId, cmd, jobId) {
             const title     = isCaptcha ? 'CAPTCHA Detected!' : 'Action Required';
             const message   = params.message || 'Please complete the required action';
             const type      = isCaptcha ? 'captcha' : 'handoff';
+            const notifId   = `sam-handoff-${jobId}`;
 
-            // Reuse injectBanner logic
-            await executeCommand(jobId, tabId, 'injectBanner', { title, message, type });
+            // OS notification — clicking focuses tab + shows resume modal
+            chrome.notifications.create(notifId, {
+                type:               'basic',
+                iconUrl:            'icons/icon48.png',
+                title:              `SAM Scraper — ${title}`,
+                message,
+                priority:           2,
+                requireInteraction: isCaptcha, // stay visible for CAPTCHA
+            });
+
+            // Click notification → focus tab + open popup with job selected
+            const notifHandler = async (clickedId) => {
+                if (clickedId !== notifId) return;
+                chrome.notifications.onClicked.removeListener(notifHandler);
+                chrome.notifications.clear(notifId);
+
+                // Store jobId so popup auto-selects it on open
+                await chrome.storage.local.set({ __samFocusJobId: jobId });
+
+                // Focus the bot tab
+                chrome.tabs.update(tabId, { active: true }).catch(() => {});
+                const tab = await chrome.tabs.get(tabId).catch(() => null);
+                if (tab?.windowId) chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+
+                if (isCaptcha) {
+                    // Inject CAPTCHA resume modal into bot tab
+                    chrome.scripting.executeScript({
+                        target: { tabId },
+                        func: (msg) => {
+                            document.getElementById('__sam-resume-modal')?.remove();
+                            const overlay = document.createElement('div');
+                            overlay.id = '__sam-resume-modal';
+                            overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;font-family:-apple-system,sans-serif;';
+                            overlay.innerHTML = `
+                                <div style="background:#fff;border-radius:12px;padding:28px 32px;max-width:380px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.3);text-align:center;">
+                                    <div style="font-size:36px;margin-bottom:12px;">🤖</div>
+                                    <div style="font-weight:700;font-size:16px;margin-bottom:8px;">CAPTCHA Detected</div>
+                                    <div style="font-size:13px;color:#555;margin-bottom:20px;">${msg}</div>
+                                    <div style="font-size:12px;color:#888;margin-bottom:20px;">Solve the CAPTCHA on the page, then click Resume below.</div>
+                                    <button id="__sam-resume-btn" style="background:#16a34a;color:#fff;border:none;padding:10px 28px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;width:100%;">✓ Resume</button>
+                                </div>
+                            `;
+                            document.body.appendChild(overlay);
+                            document.getElementById('__sam-resume-btn')?.addEventListener('click', () => {
+                                overlay.remove();
+                                window.__samResumeClicked = true;
+                            });
+                        },
+                        args: [message],
+                    }).catch(() => {});
+
+                    // Poll for resume click
+                    const resumePoll = setInterval(async () => {
+                        const r = await chrome.scripting.executeScript({
+                            target: { tabId },
+                            func:   () => window.__samResumeClicked,
+                        }).catch(() => [{ result: null }]);
+                        if (r?.[0]?.result) {
+                            clearInterval(resumePoll);
+                            await chrome.scripting.executeScript({
+                                target: { tabId },
+                                func:   () => { window.__samResumeClicked = false; },
+                            }).catch(() => {});
+                            // Fire resume via the jobs API
+                            const cfg = await getConfig();
+                            fetch(`${cfg.apiUrl}/jobs/${jobId}/resume`, {
+                                method:  'POST',
+                                headers: { 'Authorization': `Bearer ${cfg.apiSecret}` },
+                            }).catch(() => {});
+                        }
+                    }, 500);
+
+                    // Stop polling after 10 minutes
+                    setTimeout(() => clearInterval(resumePoll), 600000);
+                }
+            };
+            chrome.notifications.onClicked.addListener(notifHandler);
+
+            // Inject banner as well
+            await executeCommand(jobId, { action: 'injectBanner', params: { title, message, type } }, jobId);
             return { ok: true };
         }
 

@@ -77,6 +77,13 @@ class ExtensionScraper {
         const { mdFile, mdFileConfig } = this.resolveMdFile(county, state);
 
         this.logger?.info(`Extension scraper | markdown: ${mdFile}`);
+
+        // Notify researcher that scraping has started
+        await this.cmd('injectBanner', {
+            title:   'Scraping Started',
+            message: `Property ${this.query?.propertyId || ''} — ${county}, ${state}`,
+            type:    'start',
+        }).catch(() => {});
         if (!fs.existsSync(mdFile)) throw new Error(`Markdown not found: ${mdFile}`);
 
         // ── Optional config validation ─────────────────────────────────────────
@@ -99,6 +106,7 @@ class ExtensionScraper {
             throw new Error(`Failed to parse ${mdFileConfig}: ${e.message}`);
         }
         this._noCaptchaDetection = noCaptchaDetection;
+        this._datasetJsonPath    = mdFileConfig;
 
         const rawLines = fs.readFileSync(mdFile, 'utf8').split('\n');
 
@@ -306,13 +314,107 @@ class ExtensionScraper {
                 await this.cmd('closeExtraTabs', {}).catch(() => {});
                 return;
             }
-            if (verb === 'wait-download' || verb === 'waitdownload') {
-                // payload: "./path/to/file.pdf" or "./path/to/file.pdf 300000"
-                const parts   = payload.trim().split(/\s+/);
+            if (verb === 'smart-download' || verb === 'smartdownload') {
+                const parts    = payload.trim().split(/\s+/);
                 const savePath = parts[0];
-                const timeout  = parseInt(parts[1]) || 120000; // default 2 min
-                this.logger?.info(`Waiting for human to download PDF (timeout: ${timeout/1000}s)...`);
-                const result = await this.cmd('waitDownload', { timeout }, timeout + 5000);
+                const timeout  = parseInt(parts[1]) || 300000;
+
+                // Built-in extract functions keyed by name
+                const EXTRACT_FNS = {
+                    fl: `(function(){
+                        var tbody = document.querySelector('#ori_results tbody');
+                        if(!tbody) return null;
+                        var rows = Array.from(tbody.querySelectorAll('tr')).filter(function(r){ return r.querySelector('a.a_btn'); });
+                        return rows.map(function(r){
+                            var c = r.querySelectorAll('td');
+                            var link = r.querySelector('a.a_btn');
+                            return {
+                                partyName:   c[0]?.textContent?.trim() || '',
+                                partyType:   c[1]?.textContent?.trim() || '',
+                                date:        c[2]?.textContent?.trim() || '',
+                                docType:     c[3]?.textContent?.trim() || '',
+                                bookPage:    c[5]?.textContent?.trim() || '',
+                                description: c[8]?.firstChild?.textContent?.trim() || c[8]?.textContent?.trim() || '',
+                                href: link ? link.getAttribute('href') : null,
+                            };
+                        }).filter(function(r){ return r.href; });
+                    })()`,
+                };
+
+                // Load smartDownload config from dataset JSON
+                let sdConfig = null;
+                try {
+                    const jsonPath = this._datasetJsonPath;
+                    if (jsonPath && fs.existsSync(jsonPath)) {
+                        const json = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+                        sdConfig = json.smartDownload || null;
+                    }
+                } catch (e) {
+                    console.warn('[smart-download] failed to load JSON config:', e.message);
+                }
+
+                // Fall back to fl defaults if no config
+                const label    = sdConfig?.label   || 'Results';
+                const columns  = sdConfig?.columns  || [
+                    { key: 'partyName',   label: 'Party Name',   style: 'font-weight:500;' },
+                    { key: 'partyType',   label: 'Type',         badge: true },
+                    { key: 'date',        label: 'Date',         style: 'color:#666;' },
+                    { key: 'bookPage',    label: 'Book/Page',    style: 'font-family:monospace;font-size:12px;' },
+                    { key: 'description', label: 'Description',  style: 'color:#555;font-size:12px;' },
+                ];
+                const extractKey = sdConfig?.extract || 'fl';
+                const extract    = sdConfig?.extractFn || EXTRACT_FNS[extractKey] || EXTRACT_FNS.fl;
+
+                // Extract rows
+                const countResult = await this.cmd('evaluate', { expression: extract });
+                const results = countResult?.value;
+                if (!results || results.length === 0) throw new Error('No results found in results table');
+
+                this.logger?.info(`Results found: ${results.length}`);
+
+                let selectedHref = null;
+
+                if (results.length === 1) {
+                    this.logger?.action(`Single result — auto-downloading`);
+                    selectedHref = results[0].href;
+                } else {
+                    this.logger?.handoff(`${results.length} results — researcher selection required`);
+                    await this.cmd('injectBanner', {
+                        title:   `${results.length} Results Found`,
+                        message: `Please select the correct deed from the list.`,
+                        type:    'handoff',
+                    }).catch(() => {});
+                    const modalResult = await this.cmd('showResultsModal', {
+                        results,
+                        columns,
+                        label,
+                        timeout,
+                    }, timeout + 5000);
+                    selectedHref = modalResult?.href;
+                }
+
+                if (!selectedHref) throw new Error('No deed selected');
+
+                this.logger?.action(`Downloading selected deed`);
+                const dlResult = await this.cmd('fetchDownload', { url: selectedHref });
+                if (!dlResult?.base64) throw new Error('Download failed');
+                const buf      = Buffer.from(dlResult.base64, 'base64');
+                const fullPath = path.resolve(savePath);
+                await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+                await fs.promises.writeFile(fullPath, buf);
+                this.logger?.info(`Downloaded: ${savePath} (${buf.length} bytes)`);
+                this._downloadedFile = fullPath;
+                return;
+            }
+            if (verb === 'wait-download' || verb === 'waitdownload') {
+                // payload: "./path/file.pdf [timeout] [confirm]"
+                const parts     = payload.trim().split(/\s+/);
+                const savePath  = parts[0];
+                const timeout   = parseInt(parts[1]) || 120000;
+                const confirmed = parts[2] === 'confirm';
+                const mins      = Math.round(timeout / 60000);
+                this.logger?.info(`Waiting for human to ${confirmed ? 'select' : 'download'} PDF (timeout: ${mins} min)...`);
+                const result = await this.cmd('waitDownload', { timeout, confirmed }, timeout + 5000);
                 if (!result?.base64) throw new Error('No file received from wait-download');
                 const buf      = Buffer.from(result.base64, 'base64');
                 const fullPath = path.resolve(savePath);
@@ -344,6 +446,8 @@ class ExtensionScraper {
                 return;
             }
             if (verb === 'captcha-detection' || verb === 'captchadetection') {
+                // Wait for any post-search navigation/rendering to settle
+                await new Promise(r => setTimeout(r, 2000));
                 await this._waitForPageReady();
                 const captcha = await this._detectCaptcha();
                 if (captcha) {
@@ -381,7 +485,24 @@ class ExtensionScraper {
                 await this.cmd('expectNewTab', {});
                 return;
             }
-        }
+            if (verb === 'wait-download' || verb === 'waitdownload') {
+                const parts     = payload.trim().split(/\s+/);
+                const savePath  = parts[0];
+                const timeout   = parseInt(parts[1]) || 120000;
+                const confirmed = parts[2] === 'confirm';
+                const mins      = Math.round(timeout / 60000);
+                this.logger?.info(`Waiting for human to ${confirmed ? 'select' : 'download'} PDF (timeout: ${mins} min)...`);
+                const result = await this.cmd('waitDownload', { timeout, confirmed }, timeout + 5000);
+                if (!result?.base64) throw new Error('No file received from wait-download');
+                const buf      = Buffer.from(result.base64, 'base64');
+                const fullPath = path.resolve(savePath);
+                await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+                await fs.promises.writeFile(fullPath, buf);
+                this.logger?.info(`File captured: ${savePath} (${buf.length} bytes)`);
+                this._downloadedFile = fullPath;
+                return;
+            }
+        } // end page block
 
         if (target === 'stagehand') {
             if (verb === 'handoff') {
@@ -521,6 +642,7 @@ ${html.slice(0, 5000)}`,
                         document.querySelector('iframe[src*="recaptcha/api2/anchor"]'),
                         document.querySelector('iframe[title="reCAPTCHA"]'),
                         document.querySelector('.g-recaptcha'),
+                        document.querySelector('#recaptcha'),
                         // Cloudflare Turnstile
                         document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
                         document.querySelector('.cf-turnstile'),
@@ -528,11 +650,24 @@ ${html.slice(0, 5000)}`,
                         document.querySelector('#challenge-form'),
                         document.querySelector('.cf-browser-verification'),
                         document.querySelector('#cf-please-wait'),
+                        document.querySelector('#challenge-running'),
                         // hCaptcha
                         document.querySelector('iframe[src*="hcaptcha"]'),
                         document.querySelector('.h-captcha'),
+                        // Generic image captcha
+                        document.querySelector('img[src*="captcha"]'),
+                        document.querySelector('img[alt*="captcha" i]'),
+                        document.querySelector('input[name*="captcha" i]'),
+                        document.querySelector('input[id*="captcha" i]'),
+                        document.querySelector('[class*="captcha" i]'),
+                        document.querySelector('[id*="captcha" i]'),
+                        // Text hint on page
                     ];
-                    return signals.some(function(s){ return !!s; });
+                    var hasSignal = signals.some(function(s){ return !!s; });
+                    // Also check page text for captcha keywords
+                    var bodyText = document.body?.innerText?.toLowerCase() || '';
+                    var hasText = bodyText.includes('captcha') || bodyText.includes('robot') || bodyText.includes('human verification');
+                    return hasSignal || hasText;
                 })()`,
             });
             return result?.value === true;

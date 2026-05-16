@@ -358,7 +358,7 @@ function renderTabs(jobs, activeBridgeIds = new Set(), errorMsg = null) {
         const county     = job.query?.county || '';
         const state      = job.query?.state  || '';
         return `
-            <a class="job-list-item ${isActive ? 'active' : ''}" data-tab="${i}" href="#">
+            <a class="job-list-item ${isActive ? 'active' : ''}" data-tab="${i}" data-job-id="${job.id}" href="#">
                 <span class="job-list-dot tag-${job.status}"></span>
                 <span class="job-list-body">
                     <span class="job-list-label">${label}</span>
@@ -657,6 +657,18 @@ document.addEventListener('DOMContentLoaded', () => {
     updateStatusPill();
     updateDebuggerToggle();
     refreshJobs();
+
+    // Auto-select job if opened from notification click
+    chrome.storage.local.get('__samFocusJobId', (data) => {
+        if (data.__samFocusJobId) {
+            chrome.storage.local.remove('__samFocusJobId');
+            // Wait for jobs to render then select
+            setTimeout(() => {
+                const jobEl = document.querySelector(`[data-job-id="${data.__samFocusJobId}"]`);
+                if (jobEl) jobEl.click();
+            }, 300);
+        }
+    });
 
     // Auto-refresh every 3s, skip if user is typing
     setInterval(() => {

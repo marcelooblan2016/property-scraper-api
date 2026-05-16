@@ -1,4 +1,15 @@
 {
   "_comment": "Configuration for DEFAULT.md dataset",
-  "type": "bot-human"
+  "type": "bot-human",
+  "smartDownload": {
+    "label": "Florida Official Records",
+    "extract": "fl",
+    "columns": [
+      { "key": "partyName",   "label": "Party Name",   "style": "font-weight:500;" },
+      { "key": "partyType",   "label": "Type",         "badge": true },
+      { "key": "date",        "label": "Date",         "style": "color:#666;" },
+      { "key": "bookPage",    "label": "Book/Page",    "style": "font-family:monospace;font-size:12px;" },
+      { "key": "description", "label": "Description",  "style": "color:#555;font-size:12px;" }
+    ]
+  }
 }
