@@ -458,8 +458,9 @@ function renderTabs(jobs, activeBridgeIds = new Set(), errorMsg = null) {
             if (action === 'connect')    connectBridge(jobId);
             if (action === 'resume')     resumeJob(jobId);
             if (action === 'disconnect') disconnectBridge(jobId);
-            if (action === 'gototab')    gotoTab(jobId);
-            if (action === 'closetab')   closeTab(jobId);
+            if (action === 'gototab')     gotoTab(jobId);
+            if (action === 'minimizetab') minimizeTab(jobId);
+            if (action === 'closetab')    closeTab(jobId);
             if (action === 'restart')    restartJob(jobId);
         });
     });
@@ -504,6 +505,12 @@ async function restartJob(jobId) {
 async function gotoTab(jobId) {
     chrome.runtime.sendMessage({ type: 'FOCUS_TAB', jobId }, (res) => {
         if (!res?.ok) showToast(res?.error || 'Tab not found', 'error');
+    });
+}
+
+async function minimizeTab(jobId) {
+    chrome.runtime.sendMessage({ type: 'MINIMIZE_TAB', jobId }, (res) => {
+        if (!res?.ok) showToast(res?.error || 'Could not minimize', 'error');
     });
 }
 
@@ -658,15 +665,26 @@ document.addEventListener('DOMContentLoaded', () => {
     updateDebuggerToggle();
     refreshJobs();
 
-    // Auto-select job if opened from notification click
-    chrome.storage.local.get('__samFocusJobId', (data) => {
-        if (data.__samFocusJobId) {
-            chrome.storage.local.remove('__samFocusJobId');
-            // Wait for jobs to render then select
-            setTimeout(() => {
-                const jobEl = document.querySelector(`[data-job-id="${data.__samFocusJobId}"]`);
-                if (jobEl) jobEl.click();
-            }, 300);
+    // Auto-select job + go to tab if opened from notification click
+    chrome.storage.local.get(['__samFocusJobId', '__samFocusTabId', '__samFocusAction', '__samFocusMsg'], async (data) => {
+        if (!data.__samFocusJobId) return;
+
+        // Clear immediately so it doesn't fire again
+        chrome.storage.local.remove(['__samFocusJobId', '__samFocusTabId', '__samFocusAction', '__samFocusMsg']);
+
+        const jobId  = data.__samFocusJobId;
+        const tabId  = data.__samFocusTabId;
+        const action = data.__samFocusAction || 'goto';
+
+        // Wait for jobs to render then select the job
+        setTimeout(() => {
+            const jobEl = document.querySelector(`[data-job-id="${jobId}"]`);
+            if (jobEl) jobEl.click();
+        }, 300);
+
+        // Trigger Go to Tab via background (has popup user gesture context now)
+        if (tabId) {
+            chrome.runtime.sendMessage({ type: 'FOCUS_TAB', jobId }, () => {});
         }
     });
 

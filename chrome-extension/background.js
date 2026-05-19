@@ -113,6 +113,7 @@ async function startBridge(jobId) {
     ws.onopen = () => {
         console.log(`[bridge] WS connected | job: ${jobId}`);
         activeBridges.set(jobId, { tabId, jobId, ws });
+        chrome.storage.session.set({ [`bridge:${jobId}`]: { tabId, jobId } }).catch(() => {});
         notifyPopup('BRIDGE_STATUS', { status: 'connected', jobId, tabId });
     };
 
@@ -132,6 +133,7 @@ async function startBridge(jobId) {
         const bridge = activeBridges.get(jobId);
         if (bridge && bridge.ws === ws) {
             activeBridges.delete(jobId);
+            chrome.storage.session.remove(`bridge:${jobId}`).catch(() => {});
             notifyPopup('BRIDGE_STATUS', { status: 'disconnected', jobId });
         }
     };
@@ -689,21 +691,23 @@ async function executeCommand(tabId, cmd, jobId) {
 
         case 'showResultsModal': {
             const { results, columns, label, timeout: modalTimeout } = params;
+            const injectTabId = tabId;
 
             const selectedHref = await new Promise((resolve, reject) => {
                 const timer = setTimeout(() => {
                     chrome.scripting.executeScript({
-                        target: { tabId },
+                        target: { tabId: injectTabId },
                         func: () => document.getElementById('__sam-results-modal')?.remove(),
                     }).catch(() => {});
                     reject(new Error('Results modal timeout — no selection made'));
                 }, modalTimeout || 300000);
 
                 chrome.scripting.executeScript({
-                    target: { tabId },
-                    func: (results, columns, label) => {
+                    target: { tabId: injectTabId },
+                    func: (results, columns, label, botTabId) => {
                         document.getElementById('__sam-results-modal')?.remove();
                         window.__samModalResult = null;
+                        window.__samBotTabId    = botTabId;
 
                         const overlay = document.createElement('div');
                         overlay.id = '__sam-results-modal';
@@ -778,7 +782,7 @@ async function executeCommand(tabId, cmd, jobId) {
                             tdAction.style.cssText = 'padding:10px 14px;text-align:center;white-space:nowrap;';
 
                             const btnDownload = document.createElement('button');
-                            btnDownload.textContent = 'Download';
+                            btnDownload.textContent = 'Preview';
                             btnDownload.style.cssText = 'background:#f3f4f6;color:#374151;border:1px solid #d1d5db;padding:5px 12px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;margin-right:6px;';
                             btnDownload.addEventListener('mouseenter', () => btnDownload.style.background = '#e5e7eb');
                             btnDownload.addEventListener('mouseleave', () => btnDownload.style.background = '#f3f4f6');
@@ -788,17 +792,31 @@ async function executeCommand(tabId, cmd, jobId) {
                                 btnDownload.disabled = true;
                                 try {
                                     const pdfUrl = new URL(row.href, location.href).href;
-                                    const res    = await fetch(pdfUrl, { credentials: 'include', headers: { 'Referer': location.href } });
-                                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                                    const blob    = await res.blob();
+                                    // Ask background via chrome.runtime to fetch PDF from bot tab
+                                    const response = await new Promise((res, rej) => {
+                                        chrome.runtime.sendMessage(
+                                            { type: '__SAM_FETCH_PREVIEW__', url: pdfUrl, botTabId: window.__samBotTabId },
+                                            (r) => {
+                                                if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
+                                                else if (r?.error) rej(new Error(r.error));
+                                                else res(r?.base64);
+                                            }
+                                        );
+                                        setTimeout(() => rej(new Error('Preview timeout')), 30000);
+                                    });
+                                    const byteChars = atob(response);
+                                    const bytes     = new Uint8Array(byteChars.length);
+                                    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
+                                    const blob    = new Blob([bytes], { type: 'application/pdf' });
                                     const blobUrl = URL.createObjectURL(blob);
-                                    window.open(blobUrl, '_blank');
-                                    // Revoke after short delay
-                                    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+                                    const a = document.createElement('a');
+                                    a.href = blobUrl; a.target = '_blank'; a.rel = 'noopener';
+                                    document.body.appendChild(a); a.click(); a.remove();
+                                    setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
                                 } catch (err) {
                                     alert(`Preview failed: ${err.message}`);
                                 } finally {
-                                    btnDownload.textContent = 'Download';
+                                    btnDownload.textContent = 'Preview';
                                     btnDownload.disabled = false;
                                 }
                             });
@@ -833,13 +851,13 @@ async function executeCommand(tabId, cmd, jobId) {
                             window.__samModalResult = '__cancelled__';
                         });
                     },
-                    args: [results, columns || [], label || ''],
+                    args: [results, columns || [], label || '', tabId],
                 }).catch(() => {});
 
-                // Poll for selection
+                // Poll for selection on the inject tab
                 const poll = setInterval(async () => {
                     const r = await chrome.scripting.executeScript({
-                        target: { tabId },
+                        target: { tabId: injectTabId },
                         func:   () => window.__samModalResult,
                     }).catch(() => [{ result: null }]);
                     const val = r?.[0]?.result;
@@ -872,7 +890,7 @@ async function executeCommand(tabId, cmd, jobId) {
                 if (t.url?.startsWith('chrome://') || t.url?.startsWith('chrome-extension://')) continue;
                 chrome.scripting.executeScript({
                     target: { tabId: t.id },
-                    func: (title, message, bgColor, icon, pulse) => {
+                    func: (title, message, bgColor, icon, pulse, jobId) => {
                         document.getElementById('__sam-scraper-banner')?.remove();
                         const banner = document.createElement('div');
                         banner.id = '__sam-scraper-banner';
@@ -894,24 +912,35 @@ async function executeCommand(tabId, cmd, jobId) {
                             <div style="display:flex;align-items:flex-start;gap:8px;">
                                 <span style="font-size:18px;flex-shrink:0;">${icon}</span>
                                 <div style="flex:1;">
-                                    <div style="font-size:11px;opacity:0.85;margin-bottom:2px;">SAM Scraper</div>
+                                    <div style="font-size:11px;opacity:0.85;margin-bottom:2px;">SAM Scraper — click to go to tab</div>
                                     <div>${title}</div>
                                     <div style="font-size:11px;font-weight:400;margin-top:3px;opacity:0.9;">${message}</div>
                                 </div>
-                                <span style="font-size:16px;opacity:0.7;cursor:pointer;flex-shrink:0;" onclick="this.closest('#__sam-scraper-banner').remove()">✕</span>
+                                <span style="font-size:16px;opacity:0.7;cursor:pointer;flex-shrink:0;" onclick="event.stopPropagation();this.closest('#__sam-scraper-banner').remove()">✕</span>
                             </div>
                         `;
-                        banner.onclick = (e) => { if (e.target.tagName !== 'SPAN') banner.remove(); };
+                        // Click banner → send FOCUS_TAB to background via chrome.runtime
+                        banner.addEventListener('click', (e) => {
+                            if (e.target.closest('span[onclick]')) return;
+                            banner.remove();
+                            chrome.runtime.sendMessage({ type: 'FOCUS_TAB', jobId });
+                        });
                         document.body.appendChild(banner);
                         setTimeout(() => banner.remove(), 30000);
                     },
-                    args: [title, message, bgColor, icon, pulse],
+                    args: [title, message, bgColor, icon, pulse, jobId],
                 }).catch(() => {});
             }
 
             // Fire OS notification for start events
             if (type === 'start') {
                 const startNotifId = `sam-start-${jobId}`;
+
+                // Store metadata for persistent click handler
+                await chrome.storage.session.set({
+                    [`notif:${startNotifId}`]: { jobId, isCaptcha: false, message },
+                }).catch(() => {});
+
                 chrome.notifications.create(startNotifId, {
                     type:     'basic',
                     iconUrl:  'icons/icon48.png',
@@ -919,18 +948,6 @@ async function executeCommand(tabId, cmd, jobId) {
                     message:  message || 'Scraping has begun',
                     priority: 1,
                 });
-
-                // Click → store jobId and open popup
-                const startHandler = async (clickedId) => {
-                    if (clickedId !== startNotifId) return;
-                    chrome.notifications.onClicked.removeListener(startHandler);
-                    chrome.notifications.clear(startNotifId);
-                    await chrome.storage.local.set({ __samFocusJobId: jobId });
-                    chrome.tabs.update(tabId, { active: true }).catch(() => {});
-                    const tab = await chrome.tabs.get(tabId).catch(() => null);
-                    if (tab?.windowId) chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
-                };
-                chrome.notifications.onClicked.addListener(startHandler);
 
                 // Auto-clear after 5s
                 setTimeout(() => chrome.notifications.clear(startNotifId), 5000);
@@ -950,83 +967,20 @@ async function executeCommand(tabId, cmd, jobId) {
             const type      = isCaptcha ? 'captcha' : 'handoff';
             const notifId   = `sam-handoff-${jobId}`;
 
-            // OS notification — clicking focuses tab + shows resume modal
+            // Store metadata for persistent top-level click handler
+            await chrome.storage.session.set({
+                [`notif:${notifId}`]: { jobId, isCaptcha, message },
+            }).catch(() => {});
+
+            // OS notification
             chrome.notifications.create(notifId, {
                 type:               'basic',
                 iconUrl:            'icons/icon48.png',
                 title:              `SAM Scraper — ${title}`,
                 message,
                 priority:           2,
-                requireInteraction: isCaptcha, // stay visible for CAPTCHA
+                requireInteraction: isCaptcha,
             });
-
-            // Click notification → focus tab + open popup with job selected
-            const notifHandler = async (clickedId) => {
-                if (clickedId !== notifId) return;
-                chrome.notifications.onClicked.removeListener(notifHandler);
-                chrome.notifications.clear(notifId);
-
-                // Store jobId so popup auto-selects it on open
-                await chrome.storage.local.set({ __samFocusJobId: jobId });
-
-                // Focus the bot tab
-                chrome.tabs.update(tabId, { active: true }).catch(() => {});
-                const tab = await chrome.tabs.get(tabId).catch(() => null);
-                if (tab?.windowId) chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
-
-                if (isCaptcha) {
-                    // Inject CAPTCHA resume modal into bot tab
-                    chrome.scripting.executeScript({
-                        target: { tabId },
-                        func: (msg) => {
-                            document.getElementById('__sam-resume-modal')?.remove();
-                            const overlay = document.createElement('div');
-                            overlay.id = '__sam-resume-modal';
-                            overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;font-family:-apple-system,sans-serif;';
-                            overlay.innerHTML = `
-                                <div style="background:#fff;border-radius:12px;padding:28px 32px;max-width:380px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.3);text-align:center;">
-                                    <div style="font-size:36px;margin-bottom:12px;">🤖</div>
-                                    <div style="font-weight:700;font-size:16px;margin-bottom:8px;">CAPTCHA Detected</div>
-                                    <div style="font-size:13px;color:#555;margin-bottom:20px;">${msg}</div>
-                                    <div style="font-size:12px;color:#888;margin-bottom:20px;">Solve the CAPTCHA on the page, then click Resume below.</div>
-                                    <button id="__sam-resume-btn" style="background:#16a34a;color:#fff;border:none;padding:10px 28px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;width:100%;">✓ Resume</button>
-                                </div>
-                            `;
-                            document.body.appendChild(overlay);
-                            document.getElementById('__sam-resume-btn')?.addEventListener('click', () => {
-                                overlay.remove();
-                                window.__samResumeClicked = true;
-                            });
-                        },
-                        args: [message],
-                    }).catch(() => {});
-
-                    // Poll for resume click
-                    const resumePoll = setInterval(async () => {
-                        const r = await chrome.scripting.executeScript({
-                            target: { tabId },
-                            func:   () => window.__samResumeClicked,
-                        }).catch(() => [{ result: null }]);
-                        if (r?.[0]?.result) {
-                            clearInterval(resumePoll);
-                            await chrome.scripting.executeScript({
-                                target: { tabId },
-                                func:   () => { window.__samResumeClicked = false; },
-                            }).catch(() => {});
-                            // Fire resume via the jobs API
-                            const cfg = await getConfig();
-                            fetch(`${cfg.apiUrl}/jobs/${jobId}/resume`, {
-                                method:  'POST',
-                                headers: { 'Authorization': `Bearer ${cfg.apiSecret}` },
-                            }).catch(() => {});
-                        }
-                    }, 500);
-
-                    // Stop polling after 10 minutes
-                    setTimeout(() => clearInterval(resumePoll), 600000);
-                }
-            };
-            chrome.notifications.onClicked.addListener(notifHandler);
 
             // Inject banner as well
             await executeCommand(jobId, { action: 'injectBanner', params: { title, message, type } }, jobId);
@@ -1178,9 +1132,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 const bridge = activeBridges.get(msg.jobId);
                 if (!bridge) { sendResponse({ ok: false, error: 'No active bridge' }); return; }
                 try {
-                    const t = await chrome.tabs.get(bridge.tabId);
-                    await chrome.tabs.update(bridge.tabId, { active: true });
-                    await chrome.windows.update(t.windowId, { focused: true });
+                    const winId = bridge.botWindowId;
+                    if (winId) {
+                        await chrome.windows.update(winId, { state: 'normal', focused: true });
+                    } else {
+                        const t = await chrome.tabs.get(bridge.tabId);
+                        await chrome.tabs.update(bridge.tabId, { active: true });
+                        await chrome.windows.update(t.windowId, { focused: true });
+                    }
+                    sendResponse({ ok: true });
+                } catch (err) { sendResponse({ ok: false, error: err.message }); }
+
+            } else if (msg.type === 'MINIMIZE_TAB') {
+                const bridge = activeBridges.get(msg.jobId);
+                if (!bridge) { sendResponse({ ok: false, error: 'No active bridge' }); return; }
+                try {
+                    const winId = bridge.botWindowId;
+                    if (winId) {
+                        await chrome.windows.update(winId, { state: 'minimized' });
+                    } else {
+                        const t = await chrome.tabs.get(bridge.tabId);
+                        await chrome.windows.update(t.windowId, { state: 'minimized' });
+                    }
                     sendResponse({ ok: true });
                 } catch (err) { sendResponse({ ok: false, error: err.message }); }
 
@@ -1249,4 +1222,85 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 startPolling();
 
 // ── Open side panel on icon click ────────────────────────────────────────────
+// ── Persistent notification click handler (survives service worker sleep) ─────
+chrome.notifications.onClicked.addListener(async (notifId) => {
+    chrome.notifications.clear(notifId);
+
+    const stored = await chrome.storage.session.get(`notif:${notifId}`).catch(() => ({}));
+    const meta   = stored?.[`notif:${notifId}`];
+    if (!meta) return;
+
+    await chrome.storage.session.remove(`notif:${notifId}`).catch(() => {});
+    const { jobId, isCaptcha, message } = meta;
+
+    // Get tabId from activeBridges or session storage
+    let tabId = activeBridges.get(jobId)?.tabId;
+    if (!tabId) {
+        const bridgeStored = await chrome.storage.session.get(`bridge:${jobId}`).catch(() => ({}));
+        tabId = bridgeStored?.[`bridge:${jobId}`]?.tabId;
+    }
+    if (!tabId) { console.warn('[notif] no tabId for job:', jobId); return; }
+
+    // Store focus intent — popup reads this on open and triggers Go to Tab
+    await chrome.storage.local.set({
+        __samFocusJobId:  jobId,
+        __samFocusTabId:  tabId,
+        __samFocusAction: isCaptcha ? 'captcha' : 'goto',
+        __samFocusMsg:    message || '',
+    }).catch(() => {});
+
+    // Open popup — this IS allowed from notification click and has user gesture context
+    // Popup's DOMContentLoaded reads __samFocusTabId and calls the same FOCUS_TAB logic
+    try {
+        await chrome.action.openPopup();
+    } catch {
+        // openPopup may fail if no Chrome window is focused — fall back to tab update
+        chrome.tabs.update(tabId, { active: true }).catch(() => {});
+    }
+});
+
+// ── Go to a specific bot tab — same as "Go to Tab" button ────────────────────
+async function gotoJobTab(tabId) {
+    try {
+        const tab = await chrome.tabs.get(tabId);
+        await chrome.tabs.update(tabId, { active: true });
+        await chrome.windows.update(tab.windowId, { focused: true, drawAttention: true });
+    } catch (err) {
+        console.warn('[bridge] gotoJobTab failed:', err.message);
+    }
+}
+
 // Popup opens automatically when extension icon is clicked (defined in manifest)
+
+// ── Preview fetch handler — fetches PDF from bot tab for modal preview ────────
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.type !== '__SAM_FETCH_PREVIEW__') return false;
+
+    const { url, botTabId } = msg;
+    if (!url || !botTabId) { sendResponse({ error: 'Missing url or botTabId' }); return true; }
+
+    // Fetch PDF via CDP Runtime.evaluate on bot tab (has session cookies)
+    chrome.debugger.sendCommand({ tabId: botTabId }, 'Runtime.evaluate', {
+        expression: `(async function(){
+            const url = new URL(${JSON.stringify(url)}, location.href).href;
+            const r   = await fetch(url, { credentials: 'include', headers: { Referer: location.href } });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const buf = await r.arrayBuffer();
+            const u   = new Uint8Array(buf);
+            let b = '';
+            for (let i = 0; i < u.length; i += 8192)
+                b += String.fromCharCode(...u.subarray(i, i + 8192));
+            return btoa(b);
+        })()`,
+        awaitPromise:  true,
+        returnByValue: true,
+    }).then(res => {
+        if (res.exceptionDetails) {
+            sendResponse({ error: res.exceptionDetails?.exception?.description || 'Fetch failed' });
+        } else {
+            sendResponse({ base64: res.result?.value });
+        }
+    }).catch(err => sendResponse({ error: err.message }));
+
+    return true; // keep channel open for async response
+});

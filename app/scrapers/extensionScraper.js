@@ -208,6 +208,29 @@ class ExtensionScraper {
             } catch (err) {
                 console.error(`[ext] action failed: ${line}`, err.message);
                 this.logger?.internal(line, 'error', err.message);
+
+                // Special case: no results found
+                if (err.message?.includes('NO_RESULTS')) {
+                    this.logger?.info(`No results found — stopping job`);
+                    await this.cmd('injectBanner', {
+                        title:   'No Results Found',
+                        message: err.message.replace('NO_RESULTS:', '').trim(),
+                        type:    'warning',
+                    }).catch(() => {});
+                    await this.onComplete({ filePath: null, s3Key: null, s3Url: null });
+                    return;
+                }
+
+                // Special case: action explicitly signals CAPTCHA block
+                if (err.message?.includes('CAPTCHA_BLOCK')) {
+                    this.logger?.handoff(`CAPTCHA block detected`);
+                    await this.cmd('notifyHandoff', { message: `CAPTCHA detected. Please solve it and click Resume to continue.` }).catch(() => {});
+                    await this.cmd('injectBanner', { title: 'CAPTCHA Detected!', message: 'Please solve the CAPTCHA and click Resume.', type: 'captcha' }).catch(() => {});
+                    await this.onHandoff({ message: `CAPTCHA detected. Please solve it and click Resume to continue.` });
+                    this._captchaCooldownUntil = Date.now() + 30000;
+                    continue;
+                }
+
                 this.logger?.error(`Action failed: ${err.message}`);
 
                 // Stop MD execution and hand off to human
@@ -446,11 +469,44 @@ class ExtensionScraper {
                 return;
             }
             if (verb === 'captcha-detection' || verb === 'captchadetection') {
-                // Wait for any post-search navigation/rendering to settle
-                await new Promise(r => setTimeout(r, 2000));
+                // Poll for CAPTCHA over 5s — catches lazy-loaded iframes and JS-rendered widgets
+                const POLL_INTERVAL = 800;
+                const POLL_DURATION = 5000;
+                const start         = Date.now();
+                let captcha         = false;
+
+                this.logger?.info('Checking for CAPTCHA...');
                 await this._waitForPageReady();
-                const captcha = await this._detectCaptcha();
+
+                while (Date.now() - start < POLL_DURATION) {
+                    captcha = await this._detectCaptcha();
+                    if (captcha) break;
+                    // Log what's on page every 2 polls for debugging
+                    if ((Date.now() - start) % 1600 < 900) {
+                        const dbg = await this.cmd('evaluate', {
+                            expression: `(function(){
+                                var iframes = Array.from(document.querySelectorAll('iframe')).map(function(f){ return f.src || f.getAttribute('src') || ''; }).filter(Boolean);
+                                return { url: location.href, title: document.title, iframes: iframes, bodySnippet: document.body?.innerText?.slice(0,100) || '' };
+                            })()`,
+                        }).catch(() => null);
+                        if (dbg?.value) this.logger?.internal(`[captcha-debug] ${JSON.stringify(dbg.value)}`);
+                    }
+                    await new Promise(r => setTimeout(r, POLL_INTERVAL));
+                }
+
                 if (captcha) {
+                    // Check if it's auto-solvable (Cloudflare Turnstile, reCAPTCHA v3)
+                    const isAutoSolvable = await this._detectAutoSolvableCaptcha();
+                    if (isAutoSolvable) {
+                        this.logger?.info('Auto-solvable CAPTCHA detected (Cloudflare/Turnstile) — waiting up to 15s for auto-solve...');
+                        const solved = await this._waitForCaptchaAutoSolve(15000);
+                        if (solved) {
+                            this.logger?.info('CAPTCHA auto-solved — continuing');
+                            return;
+                        }
+                        this.logger?.info('CAPTCHA did not auto-solve — handing off to researcher');
+                    }
+
                     this.logger?.handoff(`CAPTCHA detected — human takeover needed`);
                     await this.cmd('notifyHandoff', { message: `CAPTCHA detected. Please solve it and click Resume to continue.` }).catch(() => {});
                     await this.cmd('injectBanner', { title: 'CAPTCHA Detected!', message: 'Please solve the CAPTCHA and click Resume.', type: 'captcha' }).catch(() => {});
@@ -612,6 +668,46 @@ ${html.slice(0, 5000)}`,
     }
 
     // ── Send Web Push notification ────────────────────────────────────────────
+    // ── Detect if CAPTCHA is auto-solvable (Cloudflare Turnstile, reCAPTCHA v3) ──
+    async _detectAutoSolvableCaptcha() {
+        try {
+            const result = await this.cmd('evaluate', {
+                expression: `(function(){
+                    // Cloudflare Turnstile (auto-solves)
+                    var turnstile = !!(
+                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+                        document.querySelector('.cf-turnstile') ||
+                        document.querySelector('[data-cf-turnstile]') ||
+                        document.querySelector('#challenge-running') ||
+                        document.querySelector('#cf-please-wait')
+                    );
+                    // reCAPTCHA v3 (invisible, auto-solves)
+                    var recaptchaV3 = !!(
+                        document.querySelector('script[src*="recaptcha/api.js?render"]') ||
+                        document.querySelector('.grecaptcha-badge')
+                    );
+                    return turnstile || recaptchaV3;
+                })()`,
+            });
+            return result?.value === true;
+        } catch {
+            return false;
+        }
+    }
+
+    // ── Poll until CAPTCHA disappears (auto-solved) or timeout ───────────────────
+    async _waitForCaptchaAutoSolve(timeoutMs = 15000) {
+        const interval = 1000;
+        const start    = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            await new Promise(r => setTimeout(r, interval));
+            await this._waitForPageReady(3000);
+            const stillPresent = await this._detectCaptcha();
+            if (!stillPresent) return true; // solved
+        }
+        return false; // timed out
+    }
+
     // ── Wait for page to be fully ready ──────────────────────────────────────
     async _waitForPageReady(timeoutMs = 8000) {
         // Record current tab count to detect unexpected new tabs
@@ -637,37 +733,58 @@ ${html.slice(0, 5000)}`,
         try {
             const result = await this.cmd('evaluate', {
                 expression: `(function(){
+                    // Check all iframes including ones still loading
+                    var iframes = Array.from(document.querySelectorAll('iframe'));
+                    var captchaIframe = iframes.some(function(f){
+                        var src = f.src || f.getAttribute('src') || '';
+                        return src.includes('recaptcha') ||
+                               src.includes('hcaptcha') ||
+                               src.includes('challenges.cloudflare.com') ||
+                               src.includes('captcha');
+                    });
+
                     var signals = [
                         // reCAPTCHA v2
-                        document.querySelector('iframe[src*="recaptcha/api2/anchor"]'),
-                        document.querySelector('iframe[title="reCAPTCHA"]'),
                         document.querySelector('.g-recaptcha'),
                         document.querySelector('#recaptcha'),
-                        // Cloudflare Turnstile
-                        document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
+                        document.querySelector('iframe[title="reCAPTCHA"]'),
+                        // Cloudflare
                         document.querySelector('.cf-turnstile'),
-                        // Cloudflare challenge page
                         document.querySelector('#challenge-form'),
                         document.querySelector('.cf-browser-verification'),
                         document.querySelector('#cf-please-wait'),
                         document.querySelector('#challenge-running'),
+                        document.querySelector('[data-cf-turnstile]'),
                         // hCaptcha
-                        document.querySelector('iframe[src*="hcaptcha"]'),
                         document.querySelector('.h-captcha'),
-                        // Generic image captcha
-                        document.querySelector('img[src*="captcha"]'),
+                        // Generic
+                        document.querySelector('img[src*="captcha" i]'),
                         document.querySelector('img[alt*="captcha" i]'),
                         document.querySelector('input[name*="captcha" i]'),
                         document.querySelector('input[id*="captcha" i]'),
                         document.querySelector('[class*="captcha" i]'),
                         document.querySelector('[id*="captcha" i]'),
-                        // Text hint on page
+                        // GovOS/myfloridacounty specific
+                        document.querySelector('form[action*="captcha"]'),
+                        document.querySelector('[class*="recaptcha"]'),
+                        document.querySelector('[id*="recaptcha"]'),
                     ];
                     var hasSignal = signals.some(function(s){ return !!s; });
-                    // Also check page text for captcha keywords
-                    var bodyText = document.body?.innerText?.toLowerCase() || '';
-                    var hasText = bodyText.includes('captcha') || bodyText.includes('robot') || bodyText.includes('human verification');
-                    return hasSignal || hasText;
+
+                    // Check body text
+                    var bodyText = (document.body?.innerText || '').toLowerCase();
+                    var hasText  = (
+                        bodyText.includes('enter the characters') ||
+                        bodyText.includes('prove you are human') ||
+                        bodyText.includes('human verification') ||
+                        bodyText.includes('security check') ||
+                        bodyText.includes('are you a robot') ||
+                        bodyText.includes('verify you are human') ||
+                        bodyText.includes('type the text') ||
+                        bodyText.includes('cannot be completed')
+                    );
+
+                    return captchaIframe || hasSignal || hasText;
                 })()`,
             });
             return result?.value === true;
