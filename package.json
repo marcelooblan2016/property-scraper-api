@@ -4,10 +4,11 @@
   "description": "Property deed scraper API — type1 (local/bot) and type2 (Browserbase/human-in-the-loop). Integrates with Laravel via Express REST API.",
   "main": "app/server.js",
   "scripts": {
-    "start": "node app/server.js",
-    "dev": "nodemon app/server.js",
-    "cli:bot": "node index.js --scraper=bot",
-    "cli:human": "node index.js --scraper=human"
+    "start":          "node app/server.js",
+    "dev":            "nodemon app/server.js",
+    "export:dataset": "node scripts/export-dataset.js",
+    "cli:bot":        "node index.js --scraper=bot",
+    "cli:human":      "node index.js --scraper=human"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",
@@ -22,7 +23,6 @@
     "playwright-core": "^1.44.0",
     "steel-sdk": "^0.1.0",
     "uuid": "^10.0.0",
-    "web-push": "^3.6.7",
     "ws": "^8.18.0"
   },
   "devDependencies": {

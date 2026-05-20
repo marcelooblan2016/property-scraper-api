@@ -96,6 +96,114 @@ router.get('/', async (req, res) => {
 
 // ── GET /dataset/check?state=FL&county=DIXIE ─────────────────────────────────
 // Must be before /:id to avoid being matched as a job ID
+// ── GET /jobs/dataset/export ── export all datasets as JSON for seeding ────────
+router.get('/dataset/export', (req, res) => {
+    const datasetRoot = path.join(process.cwd(), 'dataset');
+    if (!fs.existsSync(datasetRoot)) {
+        return res.json({ scraper_mds: [], scraper_configs: [] });
+    }
+
+    const scraperMds     = [];
+    const scraperConfigs = [];
+    const mdIndex        = {}; // "STATE/FILENAME" → md name for deduplication
+
+    const states = fs.readdirSync(datasetRoot).filter(f =>
+        fs.statSync(path.join(datasetRoot, f)).isDirectory()
+    );
+
+    for (const state of states) {
+        const stateDir  = path.join(datasetRoot, state);
+        const mdFiles   = fs.readdirSync(stateDir).filter(f => f.endsWith('.md'));
+
+        // Separate DEFAULT variants from main files
+        // e.g. DEFAULT-lot.md, DEFAULT-lot-subdivision.md → retries of DEFAULT.md
+        const mainFiles    = mdFiles.filter(f => !f.match(/^DEFAULT-.+\.md$/));
+        const retryFiles   = mdFiles.filter(f =>  f.match(/^DEFAULT-.+\.md$/));
+
+        // Build retry object — { "lot": "md content", "block_lot": "md content" }
+        const retries = {};
+        for (const retryFile of retryFiles) {
+            const variantName = retryFile
+                .replace('.md', '')
+                .replace('DEFAULT-', '')
+                .replace(/-/g, '_'); // block-lot → block_lot
+            const retryMd = fs.readFileSync(path.join(stateDir, retryFile), 'utf8');
+            retries[variantName] = retryMd;
+        }
+
+        for (const mdFile of mainFiles) {
+            const mdPath     = path.join(stateDir, mdFile);
+            const jsonPath   = path.join(stateDir, mdFile.replace('.md', '.json'));
+            const countyTxt  = path.join(stateDir, 'counties.txt');
+            const countyName = mdFile.replace('.md', '');
+
+            const md = fs.readFileSync(mdPath, 'utf8');
+            let config      = {};
+            let scraperType = 'bot-human';
+
+            if (fs.existsSync(jsonPath)) {
+                try {
+                    const json = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+                    scraperType = json.type || 'bot-human';
+                    const { type: _, ...rest } = json;
+                    config = rest;
+                } catch {}
+            }
+
+            // Inject retries into config if this is DEFAULT and variants exist
+            if (countyName === 'DEFAULT' && Object.keys(retries).length > 0) {
+                config = { ...config, retries };
+            }
+
+            const mdKey  = `${state}/${mdFile}`;
+            const mdName = `${state} ${countyName}`;
+
+            if (!mdIndex[mdKey]) {
+                mdIndex[mdKey] = mdName;
+                scraperMds.push({ name: mdName, md, config });
+            }
+
+            // Build scraper_configs entries
+            if (countyName === 'DEFAULT') {
+                if (fs.existsSync(countyTxt)) {
+                    const counties = fs.readFileSync(countyTxt, 'utf8')
+                        .split('\n')
+                        .map(l => l.trim())
+                        .filter(Boolean);
+
+                    for (const county of counties) {
+                        scraperConfigs.push({
+                            state_code:      state,
+                            county_name:     county,
+                            scraper_md_name: mdName,
+                            scraper_type:    scraperType,
+                            config,
+                        });
+                    }
+                } else {
+                    scraperConfigs.push({
+                        state_code:      state,
+                        county_name:     'DEFAULT',
+                        scraper_md_name: mdName,
+                        scraper_type:    scraperType,
+                        config,
+                    });
+                }
+            } else {
+                scraperConfigs.push({
+                    state_code:      state,
+                    county_name:     countyName.replace(/_/g, ' '),
+                    scraper_md_name: mdName,
+                    scraper_type:    scraperType,
+                    config,
+                });
+            }
+        }
+    }
+
+    return res.json({ scraper_mds: scraperMds, scraper_configs: scraperConfigs });
+});
+
 router.get('/dataset/check', (req, res) => {
     const state  = (req.query.state  || '').trim().toUpperCase();
     const county = (req.query.county || '').trim().toUpperCase().replace(/\s+/g, '_');
