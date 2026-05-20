@@ -16,6 +16,7 @@
 const activeBridges = new Map();
 const tabRegistry   = new Map();
 const reconnecting  = new Set(); // jobs currently reconnecting — don't auto-connect new tab
+const movingTabs    = new Set(); // tabs currently being moved between windows — suppress auto-reattach
 let pollInterval    = null;
 let autoConnected   = new Set();
 const manuallyDisconnected = new Set(); // jobs user explicitly disconnected // track jobs we already auto-connected
@@ -166,6 +167,11 @@ async function startBridge(jobId) {
         if (reason === 'target_closed') {
             console.log(`[bridge] tab ${tabId} closed | job: ${jobId}`);
             stopBridge(jobId);
+            return;
+        }
+        // Suppress auto-reattach if we're intentionally moving the tab
+        if (movingTabs.has(tabId)) {
+            console.log(`[bridge] debugger detached during tab move — skipping auto-reattach`);
             return;
         }
         console.log(`[bridge] debugger detached (${reason}) — reattaching tab ${tabId}...`);
@@ -693,6 +699,14 @@ async function executeCommand(tabId, cmd, jobId) {
             const { results, columns, label, timeout: modalTimeout } = params;
             const injectTabId = tabId;
 
+            // Capture currently active tab before injecting modal so we can return to it
+            const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            const prevTabId  = activeTabs.find(t =>
+                t.id !== injectTabId &&
+                !t.url?.startsWith('chrome://') &&
+                !t.url?.startsWith('chrome-extension://')
+            )?.id || null;
+
             const selectedHref = await new Promise((resolve, reject) => {
                 const timer = setTimeout(() => {
                     chrome.scripting.executeScript({
@@ -704,10 +718,11 @@ async function executeCommand(tabId, cmd, jobId) {
 
                 chrome.scripting.executeScript({
                     target: { tabId: injectTabId },
-                    func: (results, columns, label, botTabId) => {
+                    func: (results, columns, label, botTabId, prevTabId) => {
                         document.getElementById('__sam-results-modal')?.remove();
                         window.__samModalResult = null;
                         window.__samBotTabId    = botTabId;
+                        window.__samPrevTabId   = prevTabId; // tab to return to after confirm
 
                         const overlay = document.createElement('div');
                         overlay.id = '__sam-results-modal';
@@ -823,7 +838,7 @@ async function executeCommand(tabId, cmd, jobId) {
 
                             const btnConfirm = document.createElement('button');
                             btnConfirm.textContent = '✓ This is the Deed';
-                            btnConfirm.style.cssText = 'background:#16a34a;color:#fff;border:none;padding:5px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;';
+                            btnConfirm.style.cssText = 'background:#16a34a;color:#fff;border:2px solid #fff;padding:5px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;';
                             btnConfirm.addEventListener('mouseenter', () => btnConfirm.style.background = '#15803d');
                             btnConfirm.addEventListener('mouseleave', () => btnConfirm.style.background = '#16a34a');
                             btnConfirm.addEventListener('click', (e) => {
@@ -831,6 +846,8 @@ async function executeCommand(tabId, cmd, jobId) {
                                 document.getElementById('__sam-preview-frame')?.remove();
                                 overlay.remove();
                                 window.__samModalResult = row.href;
+                                // Go back to the tab that was active before modal was shown
+                                chrome.runtime.sendMessage({ type: 'GO_BACK_TAB', returnTabId: window.__samPrevTabId });
                             });
 
                             tdAction.appendChild(btnDownload);
@@ -851,7 +868,7 @@ async function executeCommand(tabId, cmd, jobId) {
                             window.__samModalResult = '__cancelled__';
                         });
                     },
-                    args: [results, columns || [], label || '', tabId],
+                    args: [results, columns || [], label || '', tabId, prevTabId],
                 }).catch(() => {});
 
                 // Poll for selection on the inject tab
@@ -1132,10 +1149,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 const bridge = activeBridges.get(msg.jobId);
                 if (!bridge) { sendResponse({ ok: false, error: 'No active bridge' }); return; }
                 try {
-                    const winId = bridge.botWindowId;
-                    if (winId) {
-                        await chrome.windows.update(winId, { state: 'normal', focused: true });
+                    const mainWinId = bridge.mainWindowId;
+                    if (mainWinId) {
+                        // Move tab back to researcher's main window + re-attach debugger
+                        await moveTabToWindow(bridge.tabId, mainWinId);
+                        await chrome.tabs.update(bridge.tabId, { active: true });
+                        await chrome.windows.update(mainWinId, { focused: true });
                     } else {
+                        // Fallback — just focus existing window
                         const t = await chrome.tabs.get(bridge.tabId);
                         await chrome.tabs.update(bridge.tabId, { active: true });
                         await chrome.windows.update(t.windowId, { focused: true });
@@ -1143,16 +1164,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     sendResponse({ ok: true });
                 } catch (err) { sendResponse({ ok: false, error: err.message }); }
 
-            } else if (msg.type === 'MINIMIZE_TAB') {
+            } else if (msg.type === 'GO_BACK_TAB') {
+                try {
+                    if (msg.returnTabId) {
+                        // Return to the specific tab captured before modal opened
+                        await chrome.tabs.update(msg.returnTabId, { active: true });
+                    } else {
+                        // Fallback — most recently active non-extension tab
+                        const tabs = await chrome.tabs.query({ active: false, currentWindow: true });
+                        const prev = tabs
+                            .filter(t => !t.url?.startsWith('chrome-extension://') && !t.url?.startsWith('chrome://'))
+                            .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+                        if (prev) await chrome.tabs.update(prev.id, { active: true });
+                    }
+                } catch {}
+                sendResponse({ ok: true });
                 const bridge = activeBridges.get(msg.jobId);
                 if (!bridge) { sendResponse({ ok: false, error: 'No active bridge' }); return; }
                 try {
-                    const winId = bridge.botWindowId;
-                    if (winId) {
-                        await chrome.windows.update(winId, { state: 'minimized' });
+                    const botWinId = bridge.botWindowId;
+                    if (botWinId) {
+                        // Move tab back to minimized window + re-attach debugger
+                        await moveTabToWindow(bridge.tabId, botWinId);
+                        await chrome.windows.update(botWinId, { state: 'minimized' });
                     } else {
-                        const t = await chrome.tabs.get(bridge.tabId);
-                        await chrome.windows.update(t.windowId, { state: 'minimized' });
+                        // Create a new minimized window
+                        const miniWin = await chrome.windows.create({ focused: false, state: 'minimized', url: 'about:blank' });
+                        bridge.botWindowId = miniWin.id;
+                        await moveTabToWindow(bridge.tabId, miniWin.id, 0);
+                        const blank = miniWin.tabs?.[0];
+                        if (blank && blank.id !== bridge.tabId) chrome.tabs.remove(blank.id).catch(() => {});
                     }
                     sendResponse({ ok: true });
                 } catch (err) { sendResponse({ ok: false, error: err.message }); }
@@ -1258,6 +1299,49 @@ chrome.notifications.onClicked.addListener(async (notifId) => {
         chrome.tabs.update(tabId, { active: true }).catch(() => {});
     }
 });
+
+// ── Move tab between windows while keeping debugger attached ─────────────────
+async function moveTabToWindow(tabId, windowId, index = -1) {
+    // Flag this tab as moving so onDetach doesn't auto-reattach
+    movingTabs.add(tabId);
+
+    try {
+        // Detach debugger — ignore error if already detached
+        try {
+            await chrome.debugger.detach({ tabId });
+            await new Promise(r => setTimeout(r, 300));
+        } catch { /* already detached */ }
+
+        // Move tab to new window
+        await chrome.tabs.move(tabId, { windowId, index });
+
+        // Wait for tab to settle in new window
+        await new Promise(r => setTimeout(r, 800));
+
+        // Re-attach with retries
+        let attached = false;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                await chrome.debugger.attach({ tabId }, '1.3');
+                attached = true;
+                break;
+            } catch (err) {
+                if (err.message?.includes('already attached')) { attached = true; break; }
+                console.warn(`[bridge] attach attempt ${attempt} failed:`, err.message);
+                await new Promise(r => setTimeout(r, 500 * attempt));
+            }
+        }
+
+        if (!attached) throw new Error(`Failed to re-attach debugger to tab ${tabId} after move`);
+
+        await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {});
+        await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
+        console.log(`[bridge] debugger re-attached after tab move | tab: ${tabId} → window: ${windowId}`);
+    } finally {
+        // Always clear the moving flag
+        movingTabs.delete(tabId);
+    }
+}
 
 // ── Go to a specific bot tab — same as "Go to Tab" button ────────────────────
 async function gotoJobTab(tabId) {
