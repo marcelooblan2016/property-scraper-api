@@ -66,12 +66,13 @@ class ExtensionScraper {
         // Pre-compute isBusinessName (same logic as propertyScraper)
         const businessIndicators = this.helper.businessIndicators?.() || [];
         const upperName = (this.query.ownerLastName || '').toUpperCase();
+        const normalizedName = upperName.replace(/[&,.\-\/\\]+/g, ' ').replace(/\s+/g, ' ').trim();
         this.query.isBusinessName = businessIndicators.some(indicator => {
             const escaped = indicator.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const regex   = indicator.length <= 4
                 ? new RegExp(`(?<![\\S])${escaped}(?![\\S])`)
                 : new RegExp(`\\b${escaped}\\b`);
-            return regex.test(upperName);
+            return regex.test(normalizedName);
         }) ? 'true' : 'false';
 
         const { mdFile, mdFileConfig } = this.resolveMdFile(county, state);
@@ -333,8 +334,6 @@ class ExtensionScraper {
             }
             if (verb === 'waitforurl') {
                 await this.cmd('waitForUrl', { fragment: payload, timeout: 30000 }, 35000);
-                // Close any extra tabs that opened during navigation
-                await this.cmd('closeExtraTabs', {}).catch(() => {});
                 return;
             }
             if (verb === 'smart-download' || verb === 'smartdownload') {
@@ -469,51 +468,54 @@ class ExtensionScraper {
                 return;
             }
             if (verb === 'captcha-detection' || verb === 'captchadetection') {
-                // Poll for CAPTCHA over 5s — catches lazy-loaded iframes and JS-rendered widgets
-                const POLL_INTERVAL = 800;
-                const POLL_DURATION = 5000;
-                const start         = Date.now();
-                let captcha         = false;
+                const successSelector = payload || '#ori_results';
+                const POLL_INTERVAL   = 500;
+                const POLL_DURATION   = 8000; // 8s — Cloudflare can take 3-5s to inject
+                const start           = Date.now();
+                let captcha           = false;
 
                 this.logger?.info('Checking for CAPTCHA...');
+
+                // Initial wait — let the page settle after search redirect
                 await this._waitForPageReady();
+                await new Promise(r => setTimeout(r, 500));
 
                 while (Date.now() - start < POLL_DURATION) {
                     captcha = await this._detectCaptcha();
                     if (captcha) break;
-                    // Log what's on page every 2 polls for debugging
-                    if ((Date.now() - start) % 1600 < 900) {
-                        const dbg = await this.cmd('evaluate', {
-                            expression: `(function(){
-                                var iframes = Array.from(document.querySelectorAll('iframe')).map(function(f){ return f.src || f.getAttribute('src') || ''; }).filter(Boolean);
-                                return { url: location.href, title: document.title, iframes: iframes, bodySnippet: document.body?.innerText?.slice(0,100) || '' };
-                            })()`,
-                        }).catch(() => null);
-                        if (dbg?.value) this.logger?.internal(`[captcha-debug] ${JSON.stringify(dbg.value)}`);
-                    }
                     await new Promise(r => setTimeout(r, POLL_INTERVAL));
                 }
 
                 if (captcha) {
-                    // Check if it's auto-solvable (Cloudflare Turnstile, reCAPTCHA v3)
-                    const isAutoSolvable = await this._detectAutoSolvableCaptcha();
-                    if (isAutoSolvable) {
-                        this.logger?.info('Auto-solvable CAPTCHA detected (Cloudflare/Turnstile) — waiting up to 15s for auto-solve...');
-                        const solved = await this._waitForCaptchaAutoSolve(15000);
-                        if (solved) {
-                            this.logger?.info('CAPTCHA auto-solved — continuing');
-                            return;
-                        }
-                        this.logger?.info('CAPTCHA did not auto-solve — handing off to researcher');
-                    }
+                    this.logger?.handoff(`CAPTCHA detected — waiting for human to solve...`);
+                    await this.cmd('notifyHandoff', {
+                        message:         'Solve the CAPTCHA — extension will auto-resume when results load.',
+                        successSelector, // passed to background so it polls the right selector
+                    }).catch(() => {});
+                    await this.cmd('injectBanner', {
+                        title:   'CAPTCHA Detected!',
+                        message: 'Solve the CAPTCHA — extension will auto-resume when results load.',
+                        type:    'captcha',
+                    }).catch(() => {});
 
-                    this.logger?.handoff(`CAPTCHA detected — human takeover needed`);
-                    await this.cmd('notifyHandoff', { message: `CAPTCHA detected. Please solve it and click Resume to continue.` }).catch(() => {});
-                    await this.cmd('injectBanner', { title: 'CAPTCHA Detected!', message: 'Please solve the CAPTCHA and click Resume.', type: 'captcha' }).catch(() => {});
-                    await this.onHandoff({ message: `CAPTCHA detected. Please solve it and click Resume to continue.` });
-                    this._captchaCooldownUntil = Date.now() + 30000;
+                    // Block here — scraper waits until background signals resume
+                    await this.onHandoff({ message: 'CAPTCHA detected. Solve it — auto-resuming when results appear.' });
+
+                    this.logger?.info('CAPTCHA solved — resuming');
                 } else {
-                    this.logger?.info('No CAPTCHA detected — continuing');
+                    this.logger?.info('No CAPTCHA detected — waiting for results...');
+                    // No captcha — wait for results normally with 30s timeout
+                    await this.cmd('evaluate', {
+                        expression: `new Promise((resolve, reject) => {
+                            const start = Date.now();
+                            const check = () => {
+                                if (document.querySelector(${JSON.stringify(successSelector)})) resolve(true);
+                                else if (Date.now() - start > 30000) reject(new Error('Selector timeout: ${successSelector}'));
+                                else setTimeout(check, 500);
+                            };
+                            check();
+                        })`,
+                    }, 35000);
                 }
                 return;
             }
@@ -539,23 +541,6 @@ class ExtensionScraper {
             }
             if (verb === 'expect-newtab' || verb === 'expectnewtab') {
                 await this.cmd('expectNewTab', {});
-                return;
-            }
-            if (verb === 'wait-download' || verb === 'waitdownload') {
-                const parts     = payload.trim().split(/\s+/);
-                const savePath  = parts[0];
-                const timeout   = parseInt(parts[1]) || 120000;
-                const confirmed = parts[2] === 'confirm';
-                const mins      = Math.round(timeout / 60000);
-                this.logger?.info(`Waiting for human to ${confirmed ? 'select' : 'download'} PDF (timeout: ${mins} min)...`);
-                const result = await this.cmd('waitDownload', { timeout, confirmed }, timeout + 5000);
-                if (!result?.base64) throw new Error('No file received from wait-download');
-                const buf      = Buffer.from(result.base64, 'base64');
-                const fullPath = path.resolve(savePath);
-                await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
-                await fs.promises.writeFile(fullPath, buf);
-                this.logger?.info(`File captured: ${savePath} (${buf.length} bytes)`);
-                this._downloadedFile = fullPath;
                 return;
             }
         } // end page block
@@ -667,7 +652,6 @@ ${html.slice(0, 5000)}`,
         }
     }
 
-    // ── Send Web Push notification ────────────────────────────────────────────
     // ── Detect if CAPTCHA is auto-solvable (Cloudflare Turnstile, reCAPTCHA v3) ──
     async _detectAutoSolvableCaptcha() {
         try {
@@ -710,9 +694,6 @@ ${html.slice(0, 5000)}`,
 
     // ── Wait for page to be fully ready ──────────────────────────────────────
     async _waitForPageReady(timeoutMs = 8000) {
-        // Record current tab count to detect unexpected new tabs
-        const startTabCount = await this.cmd('evaluate', { expression: 'window.name || "main"' }).catch(() => null);
-
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
             try {
@@ -748,15 +729,18 @@ ${html.slice(0, 5000)}`,
                         document.querySelector('.g-recaptcha'),
                         document.querySelector('#recaptcha'),
                         document.querySelector('iframe[title="reCAPTCHA"]'),
-                        // Cloudflare
+                        // Cloudflare Turnstile — all variants
                         document.querySelector('.cf-turnstile'),
                         document.querySelector('#challenge-form'),
                         document.querySelector('.cf-browser-verification'),
                         document.querySelector('#cf-please-wait'),
                         document.querySelector('#challenge-running'),
                         document.querySelector('[data-cf-turnstile]'),
+                        document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
+                        document.querySelector('iframe[src*="cloudflare.com/cdn-cgi"]'),
                         // hCaptcha
                         document.querySelector('.h-captcha'),
+                        document.querySelector('iframe[src*="hcaptcha"]'),
                         // Generic
                         document.querySelector('img[src*="captcha" i]'),
                         document.querySelector('img[alt*="captcha" i]'),
@@ -764,7 +748,6 @@ ${html.slice(0, 5000)}`,
                         document.querySelector('input[id*="captcha" i]'),
                         document.querySelector('[class*="captcha" i]'),
                         document.querySelector('[id*="captcha" i]'),
-                        // GovOS/myfloridacounty specific
                         document.querySelector('form[action*="captcha"]'),
                         document.querySelector('[class*="recaptcha"]'),
                         document.querySelector('[id*="recaptcha"]'),
@@ -780,6 +763,7 @@ ${html.slice(0, 5000)}`,
                         bodyText.includes('security check') ||
                         bodyText.includes('are you a robot') ||
                         bodyText.includes('verify you are human') ||
+                        bodyText.includes('please verify you are human') ||
                         bodyText.includes('type the text') ||
                         bodyText.includes('cannot be completed')
                     );

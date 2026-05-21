@@ -67,29 +67,46 @@ async function startBridge(jobId) {
 
     console.log(`[bridge] auto-connecting for job: ${jobId}`);
 
-    // Create a new background tab for this job
-    const newTab = await chrome.tabs.create({ url: 'about:blank', active: false });
-    const tabId  = newTab.id;
-    console.log(`[bridge] created tab ${tabId} for job ${jobId}`);
-    tabRegistry.set(jobId, tabId); // persist tabId even after bridge closes
+    // Reuse existing tab if we already created one for this job
+    let tabId = tabRegistry.get(jobId);
+    let newTab;
 
-    // Wait for tab to be ready
-    await new Promise((resolve) => {
-        function listener(updatedTabId, info) {
-            if (updatedTabId === tabId && info.status === 'complete') {
-                chrome.tabs.onUpdated.removeListener(listener);
-                resolve();
-            }
+    if (tabId) {
+        // Verify tab still exists
+        const existing = await chrome.tabs.get(tabId).catch(() => null);
+        if (!existing) {
+            tabId = null; // tab was closed, create a new one
+            tabRegistry.delete(jobId);
+        } else {
+            console.log(`[bridge] reusing existing tab ${tabId} for job ${jobId}`);
         }
-        chrome.tabs.onUpdated.addListener(listener);
-        chrome.tabs.get(tabId).then(t => {
-            if (t.status === 'complete') {
-                chrome.tabs.onUpdated.removeListener(listener);
-                resolve();
+    }
+
+    if (!tabId) {
+        // Create a new background tab for this job
+        newTab = await chrome.tabs.create({ url: 'about:blank', active: false });
+        tabId  = newTab.id;
+        console.log(`[bridge] created tab ${tabId} for job ${jobId}`);
+        tabRegistry.set(jobId, tabId);
+
+        // Wait for tab to be ready
+        await new Promise((resolve) => {
+            function listener(updatedTabId, info) {
+                if (updatedTabId === tabId && info.status === 'complete') {
+                    chrome.tabs.onUpdated.removeListener(listener);
+                    resolve();
+                }
             }
+            chrome.tabs.onUpdated.addListener(listener);
+            chrome.tabs.get(tabId).then(t => {
+                if (t.status === 'complete') {
+                    chrome.tabs.onUpdated.removeListener(listener);
+                    resolve();
+                }
+            });
+            setTimeout(resolve, 2000);
         });
-        setTimeout(resolve, 2000);
-    });
+    }
 
     // Attach debugger
     await chrome.debugger.attach({ tabId }, '1.3');
@@ -136,6 +153,10 @@ async function startBridge(jobId) {
             activeBridges.delete(jobId);
             chrome.storage.session.remove(`bridge:${jobId}`).catch(() => {});
             notifyPopup('BRIDGE_STATUS', { status: 'disconnected', jobId });
+            // Grace period before allowing re-connect — prevents double-connect on brief WS blip
+            setTimeout(() => {
+                autoConnected.delete(jobId);
+            }, 10000);
         }
     };
 
@@ -161,47 +182,14 @@ async function startBridge(jobId) {
         }
     });
 
-    // Auto-reattach on unexpected detach — do NOT stop bridge
+    // Handle debugger detach — only stop bridge if tab was closed
     chrome.debugger.onDetach.addListener(async (source, reason) => {
         if (source.tabId !== tabId) return;
         if (reason === 'target_closed') {
             console.log(`[bridge] tab ${tabId} closed | job: ${jobId}`);
             stopBridge(jobId);
-            return;
         }
-        // Suppress auto-reattach if we're intentionally moving the tab
-        if (movingTabs.has(tabId)) {
-            console.log(`[bridge] debugger detached during tab move — skipping auto-reattach`);
-            return;
-        }
-        console.log(`[bridge] debugger detached (${reason}) — reattaching tab ${tabId}...`);
-        reconnecting.add(jobId);
-        try {
-            await new Promise(r => setTimeout(r, 100));
-
-            // Close any extra tabs that opened (e.g. window.open from the site)
-            const allTabs = await chrome.tabs.query({});
-            for (const t of allTabs) {
-                if (t.id !== tabId && t.id > tabId &&
-                    !t.url?.startsWith('chrome-extension://') &&
-                    !t.url?.startsWith('chrome://')) {
-                    console.log(`[bridge] closing extra tab: ${t.id} ${t.url}`);
-                    await chrome.tabs.remove(t.id).catch(() => {});
-                }
-            }
-
-            await chrome.debugger.attach({ tabId }, '1.3');
-            await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {});
-            await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {});
-            await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
-
-            console.log(`[bridge] debugger re-attached | tab ${tabId}`);
-        } catch (err) {
-            console.error('[bridge] re-attach failed:', err.message);
-            stopBridge(jobId);
-        } finally {
-            reconnecting.delete(jobId);
-        }
+        // All other detach reasons (navigation, focus, devtools) — ignore
     });
 
     // Cleanup if tab closed
@@ -344,20 +332,15 @@ async function executeCommand(tabId, cmd, jobId) {
                 args: [mins, confirmed],
             }).catch(() => {});
 
-            // Intercept PDF via Page.navigatedWithinDocument or new tab navigation
-            // Strategy: watch for window.open / target=new clicks via CDP
-            // and capture the URL before it opens, then fetch via page context
             const pdfUrl = await new Promise((resolve, reject) => {
                 const timer = setTimeout(() => {
                     chrome.debugger.onEvent.removeListener(onEvent);
                     reject(new Error(`Wait download timeout — no PDF captured within ${mins} minutes`));
                 }, timeout);
 
-                // Intercept new tab requests via CDP Target events
                 chrome.debugger.sendCommand({ tabId }, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
 
                 async function onEvent(source, method, eventParams) {
-                    // Catch window.open / target=_new navigation via Target
                     if (method === 'Target.targetCreated') {
                         const info = eventParams.targetInfo;
                         if (info.type === 'page' && info.url && info.url !== 'about:blank') {
@@ -365,7 +348,6 @@ async function executeCommand(tabId, cmd, jobId) {
                             if (url.includes('/orisearch/') || url.includes('/image') || url.includes('.pdf')) {
                                 chrome.debugger.onEvent.removeListener(onEvent);
                                 clearTimeout(timer);
-                                // Close the new tab — we'll fetch the PDF ourselves
                                 chrome.tabs.query({}, (tabs) => {
                                     const newTab = tabs.find(t => t.url === url || t.id.toString() === info.targetId);
                                     if (newTab) chrome.tabs.remove(newTab.id).catch(() => {});
@@ -375,7 +357,6 @@ async function executeCommand(tabId, cmd, jobId) {
                         }
                     }
 
-                    // Also catch via Network on bot tab (some sites load PDF in same tab)
                     if (source.tabId !== tabId) return;
                     if (method === 'Network.responseReceived') {
                         const mime = eventParams.response?.mimeType || '';
@@ -386,7 +367,6 @@ async function executeCommand(tabId, cmd, jobId) {
                             resolve(url);
                         }
                     }
-                    // Catch navigation to image URL
                     if (method === 'Page.frameNavigated') {
                         const url = eventParams.frame?.url || '';
                         if (url.includes('/orisearch/s/image') || url.includes('.pdf')) {
@@ -402,7 +382,6 @@ async function executeCommand(tabId, cmd, jobId) {
             console.log(`[bridge] wait-download intercepted URL: ${pdfUrl}`);
 
             if (confirmed) {
-                // Show confirm banner on bot tab
                 chrome.tabs.update(tabId, { active: true }).catch(() => {});
                 await chrome.scripting.executeScript({
                     target: { tabId },
@@ -435,12 +414,10 @@ async function executeCommand(tabId, cmd, jobId) {
                 });
 
                 if (decision === 'no') {
-                    // Try again — re-run waitDownload recursively
                     return executeCommand(jobId, tabId, 'waitDownload', params);
                 }
             }
 
-            // Fetch PDF via page context (uses session cookies, no new tab needed)
             const res = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
                 expression: `(async function(){
                     const url = new URL(${JSON.stringify(pdfUrl)}, location.href).href;
@@ -468,7 +445,6 @@ async function executeCommand(tabId, cmd, jobId) {
         case 'expectNewTab': {
             const bridge = activeBridges.get(jobId);
             if (bridge) bridge.expectingNewTab = true;
-            // Temporarily restore window.open so target="new" links work
             await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
                 expression: `if(window.__samOrigOpen) { window.open = window.__samOrigOpen; } else { delete window.open; }`,
                 returnByValue: false,
@@ -489,7 +465,6 @@ async function executeCommand(tabId, cmd, jobId) {
                     const contentType = r.headers.get('content-type') || '';
                     if (contentType.includes('html')) {
                         const text = await r.text();
-                        // Find PDF URL in the HTML — look for embed/iframe/anchor with pdf
                         let pdfUrl = null;
                         const tags = ['embed src=', 'iframe src=', 'object data='];
                         for (const tag of tags) {
@@ -502,7 +477,6 @@ async function executeCommand(tabId, cmd, jobId) {
                                 break;
                             }
                         }
-                        // Also check for window.location or direct PDF links
                         if (!pdfUrl) {
                             const idx = text.indexOf('.pdf');
                             if (idx > -1) {
@@ -512,7 +486,6 @@ async function executeCommand(tabId, cmd, jobId) {
                             }
                         }
                         if (!pdfUrl) {
-                            // Return HTML for debugging
                             throw new Error('Could not find PDF URL in viewer. Content: ' + text.slice(0, 200));
                         }
                         pdfUrl = new URL(pdfUrl, location.href).href;
@@ -547,9 +520,7 @@ async function executeCommand(tabId, cmd, jobId) {
 
         case 'downloadnewtab': {
             const pdfTimeout = params.timeout || 20000;
-            const startTime  = Date.now();
 
-            // Record existing tabs before we start
             const existingTabs  = await chrome.tabs.query({});
             const existingIds   = new Set(existingTabs.map(t => t.id));
 
@@ -560,7 +531,6 @@ async function executeCommand(tabId, cmd, jobId) {
                     reject(new Error('New tab timeout — PDF tab did not open'));
                 }, pdfTimeout);
 
-                // Check if a new tab already opened between evaluate and now
                 chrome.tabs.query({}, (allTabs) => {
                     const newTab = allTabs
                         .filter(t => !existingIds.has(t.id) && t.id !== tabId)
@@ -583,7 +553,6 @@ async function executeCommand(tabId, cmd, jobId) {
                         return;
                     }
 
-                    // No new tab yet — wait for one
                     function onCreated(tab) {
                         if (tab.id === tabId) return;
                         chrome.tabs.onCreated.removeListener(onCreated);
@@ -610,7 +579,6 @@ async function executeCommand(tabId, cmd, jobId) {
             const pdfTabId = pdfTab.id;
             console.log(`[bridge] PDF tab: ${pdfUrl}`);
 
-            // Download via fetch with credentials (session cookies)
             let base64;
             try {
                 const response = await fetch(pdfUrl, { credentials: 'include' });
@@ -626,11 +594,9 @@ async function executeCommand(tabId, cmd, jobId) {
                 console.log(`[bridge] downloaded ${bytes.length} bytes`);
             } catch (fetchErr) {
                 console.warn(`[bridge] fetch failed (${fetchErr.message}) — trying CDP`);
-                // Fallback: attach debugger to PDF tab and get response body
                 try {
                     await chrome.debugger.attach({ tabId: pdfTabId }, '1.3');
                     await chrome.debugger.sendCommand({ tabId: pdfTabId }, 'Network.enable', {});
-                    // The page already loaded — try to get cached response
                     const result = await chrome.debugger.sendCommand({ tabId: pdfTabId }, 'Runtime.evaluate', {
                         expression: `fetch(location.href,{credentials:'include'}).then(r=>r.arrayBuffer()).then(b=>{var u=new Uint8Array(b),s='',c=8192;for(var i=0;i<u.length;i+=c)s+=String.fromCharCode(...u.subarray(i,i+c));return btoa(s)})`,
                         awaitPromise: true,
@@ -650,7 +616,6 @@ async function executeCommand(tabId, cmd, jobId) {
         }
 
         case 'catchpdf': {
-            // Intercept PDF network response before print window opens
             const pdfTimeout = params.timeout || 15000;
             const pdfData = await new Promise((resolve, reject) => {
                 const timer = setTimeout(() => {
@@ -699,7 +664,6 @@ async function executeCommand(tabId, cmd, jobId) {
             const { results, columns, label, timeout: modalTimeout } = params;
             const injectTabId = tabId;
 
-            // Capture currently active tab before injecting modal so we can return to it
             const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
             const prevTabId  = activeTabs.find(t =>
                 t.id !== injectTabId &&
@@ -722,7 +686,7 @@ async function executeCommand(tabId, cmd, jobId) {
                         document.getElementById('__sam-results-modal')?.remove();
                         window.__samModalResult = null;
                         window.__samBotTabId    = botTabId;
-                        window.__samPrevTabId   = prevTabId; // tab to return to after confirm
+                        window.__samPrevTabId   = prevTabId;
 
                         const overlay = document.createElement('div');
                         overlay.id = '__sam-results-modal';
@@ -731,7 +695,6 @@ async function executeCommand(tabId, cmd, jobId) {
                         const modal = document.createElement('div');
                         modal.style.cssText = 'background:#fff;border-radius:12px;width:min(90vw,800px);max-height:80vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.4);overflow:hidden;';
 
-                        // Header
                         const header = document.createElement('div');
                         header.style.cssText = 'background:#1a1a1a;color:#fff;padding:16px 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;';
                         header.innerHTML = `
@@ -742,14 +705,12 @@ async function executeCommand(tabId, cmd, jobId) {
                             <button id="__sam-modal-close" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;opacity:0.7;padding:4px 8px;line-height:1;">✕</button>
                         `;
 
-                        // Body
                         const body = document.createElement('div');
                         body.style.cssText = 'overflow-y:auto;flex:1;';
 
                         const table = document.createElement('table');
                         table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
 
-                        // Build thead from columns config
                         const thead = document.createElement('thead');
                         const headerRow = document.createElement('tr');
                         headerRow.style.cssText = 'background:#f5f5f5;border-bottom:2px solid #e5e5e5;position:sticky;top:0;';
@@ -765,7 +726,6 @@ async function executeCommand(tabId, cmd, jobId) {
                         thead.appendChild(headerRow);
                         table.appendChild(thead);
 
-                        // Build tbody from results
                         const tbody = document.createElement('tbody');
                         results.forEach((row) => {
                             const tr = document.createElement('tr');
@@ -778,7 +738,6 @@ async function executeCommand(tabId, cmd, jobId) {
                                 td.style.cssText = `padding:12px 14px;${col.style || ''}`;
                                 const val = row[col.key] || '';
                                 if (col.badge && val) {
-                                    // T = Grantee (blue), F = Grantor (yellow), others = gray
                                     const colors = val === 'T'
                                         ? 'background:#dbeafe;color:#1d4ed8;'
                                         : val === 'F'
@@ -792,7 +751,6 @@ async function executeCommand(tabId, cmd, jobId) {
                                 tr.appendChild(td);
                             });
 
-                            // Download (preview) + This is the Deed buttons
                             const tdAction = document.createElement('td');
                             tdAction.style.cssText = 'padding:10px 14px;text-align:center;white-space:nowrap;';
 
@@ -807,7 +765,6 @@ async function executeCommand(tabId, cmd, jobId) {
                                 btnDownload.disabled = true;
                                 try {
                                     const pdfUrl = new URL(row.href, location.href).href;
-                                    // Ask background via chrome.runtime to fetch PDF from bot tab
                                     const response = await new Promise((res, rej) => {
                                         chrome.runtime.sendMessage(
                                             { type: '__SAM_FETCH_PREVIEW__', url: pdfUrl, botTabId: window.__samBotTabId },
@@ -846,7 +803,6 @@ async function executeCommand(tabId, cmd, jobId) {
                                 document.getElementById('__sam-preview-frame')?.remove();
                                 overlay.remove();
                                 window.__samModalResult = row.href;
-                                // Go back to the tab that was active before modal was shown
                                 chrome.runtime.sendMessage({ type: 'GO_BACK_TAB', returnTabId: window.__samPrevTabId });
                             });
 
@@ -871,7 +827,6 @@ async function executeCommand(tabId, cmd, jobId) {
                     args: [results, columns || [], label || '', tabId, prevTabId],
                 }).catch(() => {});
 
-                // Poll for selection on the inject tab
                 const poll = setInterval(async () => {
                     const r = await chrome.scripting.executeScript({
                         target: { tabId: injectTabId },
@@ -891,7 +846,6 @@ async function executeCommand(tabId, cmd, jobId) {
             return { ok: true, href: selectedHref };
         }
 
-
         case 'injectBanner': {
             const { title, message, type } = params;
             const isCaptcha  = type === 'captcha';
@@ -901,7 +855,6 @@ async function executeCommand(tabId, cmd, jobId) {
             const icon       = isCaptcha ? '🤖' : isComplete ? '✅' : isStart ? '🚀' : '⏸';
             const pulse      = isCaptcha ? 'animation:__sam-pulse 1.2s ease-in-out infinite;' : '';
 
-            // Inject into all active tabs
             const tabs = await chrome.tabs.query({ active: true });
             for (const t of tabs) {
                 if (t.url?.startsWith('chrome://') || t.url?.startsWith('chrome-extension://')) continue;
@@ -936,7 +889,6 @@ async function executeCommand(tabId, cmd, jobId) {
                                 <span style="font-size:16px;opacity:0.7;cursor:pointer;flex-shrink:0;" onclick="event.stopPropagation();this.closest('#__sam-scraper-banner').remove()">✕</span>
                             </div>
                         `;
-                        // Click banner → send FOCUS_TAB to background via chrome.runtime
                         banner.addEventListener('click', (e) => {
                             if (e.target.closest('span[onclick]')) return;
                             banner.remove();
@@ -949,15 +901,11 @@ async function executeCommand(tabId, cmd, jobId) {
                 }).catch(() => {});
             }
 
-            // Fire OS notification for start events
             if (type === 'start') {
                 const startNotifId = `sam-start-${jobId}`;
-
-                // Store metadata for persistent click handler
                 await chrome.storage.session.set({
                     [`notif:${startNotifId}`]: { jobId, isCaptcha: false, message },
                 }).catch(() => {});
-
                 chrome.notifications.create(startNotifId, {
                     type:     'basic',
                     iconUrl:  'icons/icon48.png',
@@ -965,8 +913,6 @@ async function executeCommand(tabId, cmd, jobId) {
                     message:  message || 'Scraping has begun',
                     priority: 1,
                 });
-
-                // Auto-clear after 5s
                 setTimeout(() => chrome.notifications.clear(startNotifId), 5000);
             }
 
@@ -984,12 +930,10 @@ async function executeCommand(tabId, cmd, jobId) {
             const type      = isCaptcha ? 'captcha' : 'handoff';
             const notifId   = `sam-handoff-${jobId}`;
 
-            // Store metadata for persistent top-level click handler
             await chrome.storage.session.set({
                 [`notif:${notifId}`]: { jobId, isCaptcha, message },
             }).catch(() => {});
 
-            // OS notification
             chrome.notifications.create(notifId, {
                 type:               'basic',
                 iconUrl:            'icons/icon48.png',
@@ -999,23 +943,62 @@ async function executeCommand(tabId, cmd, jobId) {
                 requireInteraction: isCaptcha,
             });
 
-            // Inject banner as well
+            // ── CAPTCHA: poll from background — survives page navigation ─────
+            if (isCaptcha) {
+                const cfg             = await getConfig();
+                const successSelector = params.successSelector || '#ori_results'; // ← from extensionScraper
+
+                let pollCount = 0;
+                const MAX_POLLS = 600; // 10 minutes at 1s interval
+
+                const bgPoller = setInterval(async () => {
+                    pollCount++;
+                    if (pollCount > MAX_POLLS) {
+                        clearInterval(bgPoller);
+                        console.warn('[bridge] captcha poller timed out');
+                        return;
+                    }
+
+                    try {
+                        const results = await chrome.scripting.executeScript({
+                            target: { tabId },
+                            func: (selector) => !!document.querySelector(selector),
+                            args: [successSelector],
+                        });
+
+                        const found = results?.[0]?.result === true;
+                        if (!found) return;
+
+                        clearInterval(bgPoller);
+                        console.log(`[bridge] "${successSelector}" found — calling resume`);
+
+                        await fetch(`${cfg.apiUrl}/jobs/${jobId}/resume`, {
+                            method:  'POST',
+                            headers: { 'Authorization': `Bearer ${cfg.apiSecret}` },
+                        });
+                        console.log('[bridge] resume called successfully');
+                    } catch (err) {
+                        // Tab may be mid-navigation — keep polling
+                        console.log(`[bridge] poller check failed (navigating?): ${err.message}`);
+                    }
+                }, 1000);
+            }
+
             await executeCommand(jobId, { action: 'injectBanner', params: { title, message, type } }, jobId);
             return { ok: true };
         }
 
         case 'closeExtraTabs': {
-            // Close any tabs that opened after our bot tab (unexpected popups)
             const allTabs = await chrome.tabs.query({});
             const extras  = allTabs.filter(t =>
                 t.id !== tabId &&
-                t.id > tabId && // opened after our tab
+                t.openerTabId === tabId &&
                 !t.url?.startsWith('chrome-extension://') &&
                 !t.url?.startsWith('chrome://')
             );
             for (const t of extras) {
                 await chrome.tabs.remove(t.id).catch(() => {});
-                console.log(`[bridge] closed extra tab: ${t.id} ${t.url}`);
+                console.log(`[bridge] closed popup tab: ${t.id} ${t.url}`);
             }
             return { ok: true, closed: extras.length };
         }
@@ -1066,9 +1049,6 @@ async function startPolling() {
     if (!config.apiSecret) { console.log('[poller] no secret — skipping'); return; }
     console.log(`[poller] started | ${config.apiUrl}`);
 
-    // Subscribe/re-subscribe to push notifications
-    // (removed — using banner injection instead)
-
     pollInterval = setInterval(async () => {
         try {
             const cfg      = await getConfig();
@@ -1086,7 +1066,7 @@ async function startPolling() {
                 if (autoConnected.has(job.id)) continue;
                 if (activeBridges.has(job.id)) continue;
                 if (manuallyDisconnected.has(job.id)) continue;
-                if (reconnecting.has(job.id)) continue; // mid-navigation reconnect
+                if (reconnecting.has(job.id)) continue;
 
                 console.log(`[poller] auto-connecting job: ${job.id}`);
                 autoConnected.add(job.id);
@@ -1149,28 +1129,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 const bridge = activeBridges.get(msg.jobId);
                 if (!bridge) { sendResponse({ ok: false, error: 'No active bridge' }); return; }
                 try {
-                    const mainWinId = bridge.mainWindowId;
-                    if (mainWinId) {
-                        // Move tab back to researcher's main window + re-attach debugger
-                        await moveTabToWindow(bridge.tabId, mainWinId);
-                        await chrome.tabs.update(bridge.tabId, { active: true });
-                        await chrome.windows.update(mainWinId, { focused: true });
-                    } else {
-                        // Fallback — just focus existing window
-                        const t = await chrome.tabs.get(bridge.tabId);
-                        await chrome.tabs.update(bridge.tabId, { active: true });
-                        await chrome.windows.update(t.windowId, { focused: true });
-                    }
+                    const t = await chrome.tabs.get(bridge.tabId);
+                    await chrome.tabs.update(bridge.tabId, { active: true });
+                    await chrome.windows.update(t.windowId, { focused: true });
                     sendResponse({ ok: true });
                 } catch (err) { sendResponse({ ok: false, error: err.message }); }
 
             } else if (msg.type === 'GO_BACK_TAB') {
                 try {
                     if (msg.returnTabId) {
-                        // Return to the specific tab captured before modal opened
                         await chrome.tabs.update(msg.returnTabId, { active: true });
                     } else {
-                        // Fallback — most recently active non-extension tab
                         const tabs = await chrome.tabs.query({ active: false, currentWindow: true });
                         const prev = tabs
                             .filter(t => !t.url?.startsWith('chrome-extension://') && !t.url?.startsWith('chrome://'))
@@ -1179,27 +1148,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     }
                 } catch {}
                 sendResponse({ ok: true });
-                const bridge = activeBridges.get(msg.jobId);
-                if (!bridge) { sendResponse({ ok: false, error: 'No active bridge' }); return; }
-                try {
-                    const botWinId = bridge.botWindowId;
-                    if (botWinId) {
-                        // Move tab back to minimized window + re-attach debugger
-                        await moveTabToWindow(bridge.tabId, botWinId);
-                        await chrome.windows.update(botWinId, { state: 'minimized' });
-                    } else {
-                        // Create a new minimized window
-                        const miniWin = await chrome.windows.create({ focused: false, state: 'minimized', url: 'about:blank' });
-                        bridge.botWindowId = miniWin.id;
-                        await moveTabToWindow(bridge.tabId, miniWin.id, 0);
-                        const blank = miniWin.tabs?.[0];
-                        if (blank && blank.id !== bridge.tabId) chrome.tabs.remove(blank.id).catch(() => {});
-                    }
-                    sendResponse({ ok: true });
-                } catch (err) { sendResponse({ ok: false, error: err.message }); }
 
             } else if (msg.type === 'DETACH_DEBUGGER') {
-                // Detach debugger from all active tabs — hides the banner
                 const errors = [];
                 for (const [jobId, bridge] of activeBridges) {
                     try {
@@ -1234,7 +1184,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
             } else if (msg.type === 'CLOSE_TAB') {
                 const bridge = activeBridges.get(msg.jobId);
-                // Try bridge tabId first, fallback to stored tabId
                 const tabId = bridge?.tabId || tabRegistry.get(msg.jobId);
                 if (tabId) {
                     try { await chrome.debugger.detach({ tabId }); } catch {}
@@ -1262,8 +1211,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 startPolling();
 
-// ── Open side panel on icon click ────────────────────────────────────────────
-// ── Persistent notification click handler (survives service worker sleep) ─────
+// ── Persistent notification click handler ─────────────────────────────────────
 chrome.notifications.onClicked.addListener(async (notifId) => {
     chrome.notifications.clear(notifId);
 
@@ -1274,7 +1222,6 @@ chrome.notifications.onClicked.addListener(async (notifId) => {
     await chrome.storage.session.remove(`notif:${notifId}`).catch(() => {});
     const { jobId, isCaptcha, message } = meta;
 
-    // Get tabId from activeBridges or session storage
     let tabId = activeBridges.get(jobId)?.tabId;
     if (!tabId) {
         const bridgeStored = await chrome.storage.session.get(`bridge:${jobId}`).catch(() => ({}));
@@ -1282,43 +1229,29 @@ chrome.notifications.onClicked.addListener(async (notifId) => {
     }
     if (!tabId) { console.warn('[notif] no tabId for job:', jobId); return; }
 
-    // Store focus intent — popup reads this on open and triggers Go to Tab
-    await chrome.storage.local.set({
-        __samFocusJobId:  jobId,
-        __samFocusTabId:  tabId,
-        __samFocusAction: isCaptcha ? 'captcha' : 'goto',
-        __samFocusMsg:    message || '',
-    }).catch(() => {});
+    await chrome.storage.local.set({ __samFocusJobId: jobId }).catch(() => {});
 
-    // Open popup — this IS allowed from notification click and has user gesture context
-    // Popup's DOMContentLoaded reads __samFocusTabId and calls the same FOCUS_TAB logic
     try {
-        await chrome.action.openPopup();
-    } catch {
-        // openPopup may fail if no Chrome window is focused — fall back to tab update
-        chrome.tabs.update(tabId, { active: true }).catch(() => {});
+        const t = await chrome.tabs.get(tabId);
+        await chrome.tabs.update(tabId, { active: true });
+        await chrome.windows.update(t.windowId, { focused: true, drawAttention: true });
+    } catch (err) {
+        console.warn('[notif] focus tab failed:', err.message);
     }
 });
 
 // ── Move tab between windows while keeping debugger attached ─────────────────
 async function moveTabToWindow(tabId, windowId, index = -1) {
-    // Flag this tab as moving so onDetach doesn't auto-reattach
     movingTabs.add(tabId);
-
     try {
-        // Detach debugger — ignore error if already detached
         try {
             await chrome.debugger.detach({ tabId });
             await new Promise(r => setTimeout(r, 300));
         } catch { /* already detached */ }
 
-        // Move tab to new window
         await chrome.tabs.move(tabId, { windowId, index });
-
-        // Wait for tab to settle in new window
         await new Promise(r => setTimeout(r, 800));
 
-        // Re-attach with retries
         let attached = false;
         for (let attempt = 1; attempt <= 3; attempt++) {
             try {
@@ -1338,32 +1271,17 @@ async function moveTabToWindow(tabId, windowId, index = -1) {
         await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
         console.log(`[bridge] debugger re-attached after tab move | tab: ${tabId} → window: ${windowId}`);
     } finally {
-        // Always clear the moving flag
         movingTabs.delete(tabId);
     }
 }
 
-// ── Go to a specific bot tab — same as "Go to Tab" button ────────────────────
-async function gotoJobTab(tabId) {
-    try {
-        const tab = await chrome.tabs.get(tabId);
-        await chrome.tabs.update(tabId, { active: true });
-        await chrome.windows.update(tab.windowId, { focused: true, drawAttention: true });
-    } catch (err) {
-        console.warn('[bridge] gotoJobTab failed:', err.message);
-    }
-}
-
-// Popup opens automatically when extension icon is clicked (defined in manifest)
-
-// ── Preview fetch handler — fetches PDF from bot tab for modal preview ────────
+// ── Preview fetch handler ─────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type !== '__SAM_FETCH_PREVIEW__') return false;
 
     const { url, botTabId } = msg;
     if (!url || !botTabId) { sendResponse({ error: 'Missing url or botTabId' }); return true; }
 
-    // Fetch PDF via CDP Runtime.evaluate on bot tab (has session cookies)
     chrome.debugger.sendCommand({ tabId: botTabId }, 'Runtime.evaluate', {
         expression: `(async function(){
             const url = new URL(${JSON.stringify(url)}, location.href).href;
@@ -1386,5 +1304,5 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
     }).catch(err => sendResponse({ error: err.message }));
 
-    return true; // keep channel open for async response
+    return true;
 });

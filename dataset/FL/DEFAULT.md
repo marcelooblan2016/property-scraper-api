@@ -19,10 +19,8 @@
     [page][waitforselector] input[value="Search"]
     [page][do] await page.click('input[value="Search"]') [text="Click the Search button"]
     [page][waitfor] 4000 [text="Wait for search results to load"]
-    [page][captcha-detection] [text="Check if captcha is present after search"]
-    [page][waitfor] 1000
+    [page][captcha-detection] #ori_results [text="Check if captcha is present after search"]
     [page][evaluate] (function(){ var err = document.querySelector('span.error'); if(err && err.textContent.toLowerCase().includes('no records')) throw new Error('NO_RESULTS: No results found'); return true; })() [text="Check if results found"]
-    [page][waitforselector] #ori_results
     [page][smart-download] ./downloads/${query.propertyId}/deed.pdf 300000 [text="Smart download FL"]
 
 [elseif query.formType==='book_page']
@@ -37,8 +35,7 @@
     [page][waitforselector] input[value="Search"]
     [page][do] await page.click('input[value="Search"]') [text="Click the Search button"]
     [page][waitfor] 4000 [text="Wait for search results to load"]
-    [page][captcha-detection] [text="Check if captcha is present after search"]
-    [page][waitfor] 1000
+    [page][captcha-detection] #ori_results [text="Check if captcha is present after search"]
     [page][evaluate] (function(){ var err = document.querySelector('span.error'); if(err && err.textContent.toLowerCase().includes('no records')) throw new Error('NO_RESULTS: No results found'); return true; })() [text="Check if results found"]
     [page][waitforselector] #ori_results
     [page][evaluate] (function(){ var rows = document.querySelectorAll('tr'); var row = Array.from(rows).find(function(r){ return r.textContent.includes('${query.book}/${query.page}'); }); if(!row) throw new Error('Row not found for ${query.book}/${query.page}'); var link = row.querySelector('a.a_btn'); if(!link) throw new Error('View Image not found'); window.__samHref = link.getAttribute('href'); return true; })() [text="Find View Image link for ${query.book}/${query.page}"]
